@@ -4,6 +4,7 @@ use crate::executors::{
 };
 use alloy_dyn_abi::JsonAbiExt;
 use alloy_primitives::U256;
+use core::panic;
 use eyre::eyre;
 use foundry_config::InvariantConfig;
 use foundry_evm_fuzz::{
@@ -55,6 +56,7 @@ struct Corpus {
     // Corpus call sequence.
     #[serde(skip_serializing)]
     tx_seq: Vec<BasicTxDetails>,
+    is_favored: bool,
 }
 
 impl Corpus {
@@ -65,12 +67,18 @@ impl Corpus {
         } else {
             Uuid::new_v4()
         };
-        Ok(Self { uuid, total_mutations: 0, new_finds_produced: 0, tx_seq })
+        Ok(Self { uuid, total_mutations: 0, new_finds_produced: 0, tx_seq, is_favored: false })
     }
 
     /// New corpus with given call sequence and new uuid.
     pub fn from_tx_seq(tx_seq: Vec<BasicTxDetails>) -> Self {
-        Self { uuid: Uuid::new_v4(), total_mutations: 0, new_finds_produced: 0, tx_seq }
+        Self {
+            uuid: Uuid::new_v4(),
+            total_mutations: 0,
+            new_finds_produced: 0,
+            tx_seq,
+            is_favored: false,
+        }
     }
 }
 
@@ -81,7 +89,7 @@ pub struct TxCorpusManager {
     // Call sequence mutation strategy type generator.
     mutation_generator: BoxedStrategy<MutationType>,
     // Path to invariant corpus directory. If None, sequences with new coverage are not persisted.
-    corpus_dir: Option<PathBuf>,
+    corpus_dir: Option<PathBuf>, // TODO consolidate into config
     // Whether corpus to use gzip file compression and decompression.
     corpus_gzip: bool,
     // Number of mutations until entry marked as eligible to be flushed from in-memory corpus.
@@ -96,6 +104,11 @@ pub struct TxCorpusManager {
     current_mutated: Option<Uuid>,
     // Number of failed replays from persisted corpus.
     failed_replays: usize,
+    // Corpus Stats.
+    pub(crate) cumulative_edges_seen: usize,
+    pub(crate) cumulative_features_seen: usize,
+    pub(crate) corpus_count: usize,
+    pub(crate) favored_items: usize,
 }
 
 impl TxCorpusManager {
@@ -134,6 +147,10 @@ impl TxCorpusManager {
                 in_memory_corpus,
                 current_mutated: None,
                 failed_replays,
+                cumulative_edges_seen: 0,
+                cumulative_features_seen: 0,
+                corpus_count: 0,
+                favored_items: 0,
             })
         };
 
@@ -145,6 +162,10 @@ impl TxCorpusManager {
 
         let fuzzed_contracts = fuzzed_contracts.targets.lock();
 
+        let mut cumulative_edges_seen = 0;
+        let mut cumulative_features_seen = 0;
+        let mut corpus_count = 0;
+
         for entry in std::fs::read_dir(&corpus_dir)? {
             let path = entry?.path();
             if path.is_file() {
@@ -155,6 +176,7 @@ impl TxCorpusManager {
                     }
                 }
             }
+            corpus_count += 1;
 
             let read_corpus_result = match path.extension().and_then(|ext| ext.to_str()) {
                 Some("gz") => foundry_common::fs::read_json_gzip_file::<Vec<BasicTxDetails>>(&path),
@@ -180,7 +202,15 @@ impl TxCorpusManager {
                         .map_err(|e| eyre!(format!("Could not make raw evm call: {e}")))?;
 
                     if fuzzed_contracts.can_replay(tx) {
-                        call_result.merge_edge_coverage(history_map);
+                        let (new_coverage, is_edge) = call_result.merge_edge_coverage(history_map);
+                        if new_coverage {
+                            if is_edge {
+                                cumulative_edges_seen += 1;
+                            } else {
+                                cumulative_features_seen += 1;
+                            }
+                        }
+
                         executor.commit(&mut call_result);
                     } else {
                         failed_replays += 1;
@@ -209,6 +239,10 @@ impl TxCorpusManager {
             in_memory_corpus,
             current_mutated: None,
             failed_replays,
+            cumulative_edges_seen,
+            cumulative_features_seen,
+            favored_items: 0,
+            corpus_count,
         })
     }
 
@@ -229,6 +263,14 @@ impl TxCorpusManager {
                 if test_run.new_coverage {
                     corpus.new_finds_produced += 1
                 }
+                let is_favored =
+                    (corpus.new_finds_produced as f64 / corpus.total_mutations as f64) < 0.3;
+                if is_favored && !corpus.is_favored {
+                    self.favored_items += 1;
+                } else if !is_favored && corpus.is_favored {
+                    self.favored_items -= 1;
+                }
+                corpus.is_favored = is_favored;
 
                 trace!(
                     target: "corpus",
@@ -273,6 +315,7 @@ impl TxCorpusManager {
 
         // This includes reverting txs in the corpus and `can_continue` removes
         // them. We want this as it is new coverage and may help reach the other branch.
+        self.corpus_count += 1;
         self.in_memory_corpus.push(corpus);
     }
 
@@ -291,14 +334,14 @@ impl TxCorpusManager {
 
         if !self.in_memory_corpus.is_empty() {
             // Flush oldest corpus mutated more than configured max mutations unless they are
-            // producing new finds more than 1/3 of the time.
+            // favored (producing new finds more than 1/3 of the time).
             let should_evict = self.in_memory_corpus.len() > self.corpus_min_size.max(1);
             if should_evict {
                 if let Some(index) = self.in_memory_corpus.iter().position(|corpus| {
-                    corpus.total_mutations > self.corpus_min_mutations &&
-                        (corpus.new_finds_produced as f64 / corpus.total_mutations as f64) < 0.3
+                    corpus.total_mutations > self.corpus_min_mutations && !corpus.is_favored
                 }) {
                     let corpus = self.in_memory_corpus.get(index).unwrap();
+
                     let uuid = corpus.uuid;
                     debug!(target: "corpus", "evict corpus {uuid}");
 
@@ -313,6 +356,7 @@ impl TxCorpusManager {
                             .as_path(),
                         &corpus,
                     )?;
+
                     // Remove corpus from memory.
                     self.in_memory_corpus.remove(index);
                 }
@@ -331,9 +375,9 @@ impl TxCorpusManager {
             match mutation_type {
                 MutationType::Splice => {
                     trace!(target: "corpus", "splice {} and {}", primary.uuid, secondary.uuid);
-                    if should_evict {
-                        self.current_mutated = Some(primary.uuid);
-                    }
+
+                    self.current_mutated = Some(primary.uuid);
+
                     let start1 = rng.random_range(0..primary.tx_seq.len());
                     let end1 = rng.random_range(start1..primary.tx_seq.len());
 
@@ -350,9 +394,9 @@ impl TxCorpusManager {
                 MutationType::Repeat => {
                     let corpus = if rng.random::<bool>() { primary } else { secondary };
                     trace!(target: "corpus", "repeat {}", corpus.uuid);
-                    if should_evict {
-                        self.current_mutated = Some(corpus.uuid);
-                    }
+
+                    self.current_mutated = Some(corpus.uuid);
+
                     new_seq = corpus.tx_seq.clone();
                     let start = rng.random_range(0..corpus.tx_seq.len());
                     let end = rng.random_range(start..corpus.tx_seq.len());
@@ -362,9 +406,9 @@ impl TxCorpusManager {
                 }
                 MutationType::Interleave => {
                     trace!(target: "corpus", "interleave {} with {}", primary.uuid, secondary.uuid);
-                    if should_evict {
-                        self.current_mutated = Some(primary.uuid);
-                    }
+
+                    self.current_mutated = Some(primary.uuid);
+
                     for (tx1, tx2) in primary.tx_seq.iter().zip(secondary.tx_seq.iter()) {
                         // chunks?
                         let tx = if rng.random::<bool>() { tx1.clone() } else { tx2.clone() };
@@ -374,9 +418,9 @@ impl TxCorpusManager {
                 MutationType::Prefix => {
                     let corpus = if rng.random::<bool>() { primary } else { secondary };
                     trace!(target: "corpus", "overwrite prefix of {}", corpus.uuid);
-                    if should_evict {
-                        self.current_mutated = Some(corpus.uuid);
-                    }
+
+                    self.current_mutated = Some(corpus.uuid);
+
                     new_seq = corpus.tx_seq.clone();
                     for i in 0..rng.random_range(0..=new_seq.len()) {
                         new_seq[i] = self.new_tx(test_runner)?;
@@ -385,9 +429,9 @@ impl TxCorpusManager {
                 MutationType::Suffix => {
                     let corpus = if rng.random::<bool>() { primary } else { secondary };
                     trace!(target: "corpus", "overwrite suffix of {}", corpus.uuid);
-                    if should_evict {
-                        self.current_mutated = Some(corpus.uuid);
-                    }
+
+                    self.current_mutated = Some(corpus.uuid);
+
                     new_seq = corpus.tx_seq.clone();
                     for i in new_seq.len() - rng.random_range(0..new_seq.len())..corpus.tx_seq.len()
                     {
@@ -398,9 +442,9 @@ impl TxCorpusManager {
                     let targets = test.targeted_contracts.targets.lock();
                     let corpus = if rng.random::<bool>() { primary } else { secondary };
                     trace!(target: "corpus", "ABI mutate args of {}", corpus.uuid);
-                    if should_evict {
-                        self.current_mutated = Some(corpus.uuid);
-                    }
+
+                    self.current_mutated = Some(corpus.uuid);
+
                     new_seq = corpus.tx_seq.clone();
 
                     let idx = rng.random_range(0..new_seq.len());

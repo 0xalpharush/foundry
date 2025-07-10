@@ -32,6 +32,7 @@ use std::{
     cell::RefCell,
     collections::{btree_map::Entry, HashMap as Map},
     sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 mod error;
@@ -342,10 +343,12 @@ impl<'a> InvariantExecutor<'a> {
         // Start timer for this invariant test.
         let mut runs = 0;
         let timer = FuzzTestTimer::new(self.config.timeout);
+        const DURATION_BETWEEN_METRICS_REPORT: Duration = Duration::from_secs(5);
+        let mut last_metrics_report = Instant::now();
         let continue_campaign = |runs: u32| {
             // If timeout is configured, then perform invariant runs until expires.
             if self.config.timeout.is_some() {
-                return !timer.is_timed_out()
+                return !timer.is_timed_out();
             }
             // If no timeout configured then loop until configured runs.
             runs < self.config.runs
@@ -364,7 +367,7 @@ impl<'a> InvariantExecutor<'a> {
 
             // We stop the run immediately if we have reverted, and `fail_on_revert` is set.
             if self.config.fail_on_revert && invariant_test.reverts() > 0 {
-                return Err(eyre!("call reverted"))
+                return Err(eyre!("call reverted"));
             }
 
             while current_run.depth < self.config.depth {
@@ -403,10 +406,17 @@ impl<'a> InvariantExecutor<'a> {
                 invariant_test.merge_coverage(call_result.line_coverage.clone());
                 // If coverage guided fuzzing is enabled then merge edge count with current history
                 // map and set new coverage in current run.
-                if self.config.corpus_dir.is_some() &&
-                    call_result.merge_edge_coverage(&mut self.history_map)
-                {
-                    current_run.new_coverage = true;
+                if self.config.corpus_dir.is_some() {
+                    let (new_coverage, is_edge) =
+                        call_result.merge_edge_coverage(&mut self.history_map);
+                    if new_coverage {
+                        current_run.new_coverage = true;
+                        if is_edge {
+                            corpus_manager.cumulative_edges_seen += 1;
+                        } else {
+                            corpus_manager.cumulative_features_seen += 1;
+                        }
+                    }
                 }
 
                 if discarded {
@@ -512,6 +522,20 @@ impl<'a> InvariantExecutor<'a> {
             }
 
             runs += 1;
+
+            // At the end of each run, print metrics if enough time has elapsed
+            if last_metrics_report.elapsed() > DURATION_BETWEEN_METRICS_REPORT {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                let corpus_count = corpus_manager.corpus_count;
+                let cumulative_edges_seen = corpus_manager.cumulative_edges_seen;
+                let cumulative_features_seen = corpus_manager.cumulative_features_seen;
+                let favored_items = corpus_manager.favored_items;
+                println!(
+                    "{{\"timestamp\":{},\"cumulative_edges_seen\":{},\"cumulative_features_seen\":{},\"corpus_count\":{},\"sequences_tested\":{},\"favored_items\":{}}}",
+                    now, cumulative_edges_seen, cumulative_features_seen, corpus_count, runs, favored_items
+                );
+                last_metrics_report = Instant::now();
+            }
         }
 
         trace!(?fuzz_fixtures);
@@ -597,7 +621,7 @@ impl<'a> InvariantExecutor<'a> {
             &mut failures,
         )?;
         if let Some(error) = failures.error {
-            return Err(eyre!(error.revert_reason().unwrap_or_default()))
+            return Err(eyre!(error.revert_reason().unwrap_or_default()));
         }
 
         let corpus_manager = TxCorpusManager::new(
@@ -711,7 +735,7 @@ impl<'a> InvariantExecutor<'a> {
                     .wrap_err(format!("{contract} does not have the selector {selector:?}"))?;
             }
 
-            return Ok(artifact.identifier())
+            return Ok(artifact.identifier());
         }
         eyre::bail!("{contract} not found in the project. Allowed format: `contract_name` or `contract_path:contract_name`.");
     }
@@ -860,7 +884,7 @@ impl<'a> InvariantExecutor<'a> {
     ) -> eyre::Result<()> {
         // Do not add address in target contracts if no function selected.
         if selectors.is_empty() {
-            return Ok(())
+            return Ok(());
         }
 
         let contract = match targeted_contracts.entry(address) {
