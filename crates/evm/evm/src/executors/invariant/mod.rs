@@ -5,6 +5,7 @@ use crate::{
     },
     inspectors::Fuzzer,
 };
+use alloy_json_abi::Function;
 use alloy_primitives::{
     Address, Bytes, FixedBytes, I256, Selector, U256,
     map::{AddressMap, HashMap},
@@ -35,7 +36,7 @@ use foundry_evm_traces::{CallTraceArena, SparsedTraceArena};
 use indicatif::ProgressBar;
 use parking_lot::RwLock;
 use proptest::{strategy::Strategy, test_runner::TestRunner};
-use result::{assert_after_invariant, assert_invariants, can_continue};
+use result::{assert_after_invariant, can_continue};
 use revm::state::Account;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -50,12 +51,13 @@ pub use error::{InvariantFailures, InvariantFuzzError};
 use foundry_evm_coverage::HitMaps;
 
 mod replay;
-pub use replay::{replay_error, replay_run};
+pub use replay::{generate_counterexample, replay_error, replay_run};
 
 mod result;
 pub use result::InvariantFuzzTestResult;
 
 mod shrink;
+use crate::executors::invariant::result::invariant_preflight_check;
 pub use shrink::{check_sequence, check_sequence_value};
 
 sol! {
@@ -133,8 +135,6 @@ struct InvariantTestData {
     last_run_inputs: Vec<BasicTxDetails>,
     // Additional traces for gas report.
     gas_report_traces: Vec<Vec<CallTraceArena>>,
-    // Last call results of the invariant test.
-    last_call_results: Option<RawCallResult>,
     // Line coverage information collected from all fuzzed calls.
     line_coverage: Option<HitMaps>,
     // Metrics for each fuzzed selector.
@@ -168,19 +168,13 @@ impl InvariantTest {
         fuzz_state: EvmFuzzState,
         targeted_contracts: FuzzRunIdentifiedContracts,
         failures: InvariantFailures,
-        last_call_results: Option<RawCallResult>,
         branch_runner: TestRunner,
     ) -> Self {
-        let mut fuzz_cases = vec![];
-        if last_call_results.is_none() {
-            fuzz_cases.push(FuzzedCases::new(vec![]));
-        }
         let test_data = InvariantTestData {
-            fuzz_cases,
+            fuzz_cases: vec![],
             failures,
             last_run_inputs: vec![],
             gas_report_traces: vec![],
-            last_call_results,
             line_coverage: None,
             metrics: Map::default(),
             branch_runner,
@@ -196,18 +190,13 @@ impl InvariantTest {
     }
 
     /// Whether invariant test has errors or not.
-    fn has_errors(&self) -> bool {
-        self.test_data.failures.error.is_some()
+    fn has_errors(&self, invariant: &Function) -> bool {
+        self.test_data.failures.has_failure(invariant)
     }
 
     /// Set invariant test error.
-    fn set_error(&mut self, error: InvariantFuzzError) {
-        self.test_data.failures.error = Some(error);
-    }
-
-    /// Set last invariant test call results.
-    fn set_last_call_results(&mut self, call_result: Option<RawCallResult>) {
-        self.test_data.last_call_results = call_result;
+    fn set_error(&mut self, invariant: &Function, error: InvariantFuzzError) {
+        self.test_data.failures.record_failure(invariant, error);
     }
 
     /// Set last invariant run call sequence.
@@ -354,7 +343,7 @@ impl<'a> InvariantExecutor<'a> {
         early_exit: &EarlyExit,
     ) -> Result<InvariantFuzzTestResult> {
         // Throw an error to abort test run if the invariant function accepts input params
-        if !invariant_contract.invariant_function.inputs.is_empty() {
+        if !invariant_contract.invariant_fn.inputs.is_empty() {
             return Err(eyre!("Invariant test function should have no inputs"));
         }
 
@@ -430,9 +419,10 @@ impl<'a> InvariantExecutor<'a> {
                     current_run.inputs.pop();
                     current_run.rejects += 1;
                     if current_run.rejects > self.config.max_assume_rejects {
-                        invariant_test.set_error(InvariantFuzzError::MaxAssumeRejects(
-                            self.config.max_assume_rejects,
-                        ));
+                        invariant_test.set_error(
+                            invariant_contract.invariant_fn,
+                            InvariantFuzzError::MaxAssumeRejects(self.config.max_assume_rejects),
+                        );
                         break 'stop;
                     }
                 } else {
@@ -488,7 +478,7 @@ impl<'a> InvariantExecutor<'a> {
                             || is_last_call
                     };
 
-                    let result = if should_check_invariant {
+                    let can_continue = if should_check_invariant {
                         can_continue(
                             &invariant_contract,
                             &mut invariant_test,
@@ -503,41 +493,42 @@ impl<'a> InvariantExecutor<'a> {
                         if call_result.reverted {
                             invariant_test.test_data.failures.reverts += 1;
                             if self.config.fail_on_revert {
-                                let case_data = error::FailedInvariantCaseData::new(
-                                    &invariant_contract,
-                                    &self.config,
-                                    &invariant_test.targeted_contracts,
-                                    &current_run.inputs,
-                                    call_result,
-                                    &[],
-                                );
-                                invariant_test.test_data.failures.revert_reason =
-                                    Some(case_data.revert_reason.clone());
-                                invariant_test.test_data.failures.error =
-                                    Some(InvariantFuzzError::Revert(case_data));
-                                result::RichInvariantResults::new(false, None)
+                                for (invariant, fail_on_revert) in &invariant_contract.invariant_fns {
+                                    if *fail_on_revert {
+                                        let case_data = error::FailedInvariantCaseData::new(
+                                            &invariant_contract,
+                                            self.config.shrink_run_limit,
+                                            *fail_on_revert,
+                                            &invariant_test.targeted_contracts,
+                                            &current_run.inputs,
+                                            &call_result,
+                                            &[],
+                                        );
+                                        invariant_test.test_data.failures
+                                            .errors
+                                            .insert(invariant.name.clone(), InvariantFuzzError::Revert(case_data));
+                                    }
+                                }
+                                false
                             } else if !invariant_contract.is_optimization() {
                                 // In optimization mode, keep reverted calls to preserve
                                 // warp/roll values for correct replay during shrinking.
                                 current_run.inputs.pop();
-                                result::RichInvariantResults::new(true, None)
+                                true
                             } else {
-                                result::RichInvariantResults::new(true, None)
+                                true
                             }
                         } else {
-                            result::RichInvariantResults::new(true, None)
+                            true
                         }
                     };
-
-                    if !result.can_continue || current_run.depth == self.config.depth - 1 {
+                    if !can_continue || current_run.depth == self.config.depth - 1 {
                         invariant_test.set_last_run_inputs(&current_run.inputs);
                     }
                     // If test cannot continue then stop current run and exit test suite.
-                    if !result.can_continue {
+                    if !can_continue {
                         break 'stop;
                     }
-
-                    invariant_test.set_last_call_results(result.call_result);
                     current_run.depth += 1;
                 }
 
@@ -553,7 +544,9 @@ impl<'a> InvariantExecutor<'a> {
             corpus_manager.process_inputs(&current_run.inputs, current_run.new_coverage);
 
             // Call `afterInvariant` only if it is declared and test didn't fail already.
-            if invariant_contract.call_after_invariant && !invariant_test.has_errors() {
+            if invariant_contract.call_after_invariant
+                && !invariant_test.has_errors(invariant_contract.invariant_fn)
+            {
                 assert_after_invariant(
                     &invariant_contract,
                     &mut invariant_test,
@@ -568,10 +561,18 @@ impl<'a> InvariantExecutor<'a> {
             if let Some(progress) = progress {
                 // If running with progress then increment completed runs.
                 progress.inc(1);
-                // Display metrics in progress bar.
-                if edge_coverage_enabled {
-                    progress.set_message(format!("{}", &corpus_manager.metrics));
+
+                let failures = &invariant_test.test_data.failures;
+                let mut parts = Vec::new();
+                // Add failures if present
+                if !failures.errors.is_empty() {
+                    parts.push(format!("{failures}"));
                 }
+                // Add edge coverage metrics if enabled
+                if edge_coverage_enabled {
+                    parts.push(format!("{}", corpus_manager.metrics));
+                }
+                progress.set_message(parts.join(""));
             } else if edge_coverage_enabled
                 && last_metrics_report.elapsed() > DURATION_BETWEEN_METRICS_REPORT
             {
@@ -580,7 +581,7 @@ impl<'a> InvariantExecutor<'a> {
                     "timestamp": SystemTime::now()
                         .duration_since(UNIX_EPOCH)?
                         .as_secs(),
-                    "invariant": invariant_contract.invariant_function.name,
+                    "invariant": invariant_contract.invariant_fn.name,
                     "metrics": &corpus_manager.metrics,
                 });
                 let _ = sh_println!("{}", serde_json::to_string(&metrics)?);
@@ -595,7 +596,7 @@ impl<'a> InvariantExecutor<'a> {
 
         let result = invariant_test.test_data;
         Ok(InvariantFuzzTestResult {
-            error: result.failures.error,
+            errors: result.failures.errors,
             cases: result.fuzz_cases,
             reverts: result.failures.reverts,
             last_run_inputs: result.last_run_inputs,
@@ -655,7 +656,7 @@ impl<'a> InvariantExecutor<'a> {
         // already know if we can early exit the invariant run.
         // This does not count as a fuzz run. It will just register the revert.
         let mut failures = InvariantFailures::new();
-        let last_call_results = assert_invariants(
+        invariant_preflight_check(
             invariant_contract,
             &self.config,
             &targeted_contracts,
@@ -663,7 +664,7 @@ impl<'a> InvariantExecutor<'a> {
             &[],
             &mut failures,
         )?;
-        if let Some(error) = failures.error {
+        if let Some(error) = failures.get_failure(invariant_contract.invariant_fn) {
             return Err(eyre!(error.revert_reason().unwrap_or_default()));
         }
 
@@ -705,13 +706,8 @@ impl<'a> InvariantExecutor<'a> {
             Some(&targeted_contracts),
         )?;
 
-        let invariant_test = InvariantTest::new(
-            fuzz_state,
-            targeted_contracts,
-            failures,
-            last_call_results,
-            self.runner.clone(),
-        );
+        let invariant_test =
+            InvariantTest::new(fuzz_state, targeted_contracts, failures, self.runner.clone());
 
         Ok((invariant_test, worker))
     }
