@@ -801,6 +801,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
                         call_details: CallDetails {
                             target: seq.addr.unwrap_or_default(),
                             calldata: seq.calldata.clone(),
+                            value: None,
                         },
                     }
                 })

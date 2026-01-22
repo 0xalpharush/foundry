@@ -45,13 +45,16 @@ use foundry_evm_core::evm::FoundryEvmNetwork;
 use foundry_evm_fuzz::{
     BasicTxDetails,
     invariant::FuzzRunIdentifiedContracts,
-    strategies::{EvmFuzzState, mutate_param_value},
+    strategies::{EvmFuzzState, generate_msg_value, mutate_param_value},
 };
 use proptest::{
     prelude::{Just, Rng, Strategy},
-    prop_oneof,
     strategy::{BoxedStrategy, ValueTree},
     test_runner::TestRunner,
+};
+use rand::{
+    distr::{Distribution, weighted::WeightedIndex},
+    seq::SliceRandom,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -78,7 +81,7 @@ const COVERAGE_MAP_SIZE: usize = 65536;
 const GZIP_THRESHOLD: usize = 4 * 1024;
 
 /// Possible mutation strategies to apply on a call sequence.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum MutationType {
     /// Splice original call sequence.
     Splice,
@@ -90,8 +93,27 @@ enum MutationType {
     Prefix,
     /// Replace suffix of the original call sequence with new calls.
     Suffix,
-    /// ABI mutate random args of selected call in sequence.
+    /// ABI mutate random args in a variable number of calls.
     Abi,
+}
+
+const CORPUS_MUTATION_WEIGHTS: &[(MutationType, u32)] = &[
+    (MutationType::Splice, 100),
+    (MutationType::Repeat, 100),
+    (MutationType::Interleave, 100),
+    (MutationType::Prefix, 100),
+    (MutationType::Suffix, 100),
+    (MutationType::Abi, 100),
+];
+
+fn weighted_mutation<R: Rng + ?Sized>(rng: &mut R) -> Result<MutationType> {
+    let dist = WeightedIndex::new(CORPUS_MUTATION_WEIGHTS.iter().map(|(_, weight)| *weight))
+        .map_err(|err| eyre!("invalid corpus mutation weights: {err}"))?;
+    Ok(CORPUS_MUTATION_WEIGHTS[dist.sample(rng)].0)
+}
+
+fn abi_mutation_count<R: Rng + ?Sized>(seq_len: usize, rng: &mut R) -> usize {
+    if seq_len <= 1 { seq_len } else { rng.random_range(2..=seq_len) }
 }
 
 /// Persisted optimization state: the best value found and the sequence that produced it.
@@ -265,8 +287,6 @@ pub struct WorkerCorpus {
     pub(crate) metrics: CorpusMetrics,
     /// Fuzzed calls generator.
     tx_generator: BoxedStrategy<BasicTxDetails>,
-    /// Call sequence mutation strategy type generator used by stateful fuzzing.
-    mutation_generator: BoxedStrategy<MutationType>,
     /// Identifier of current mutated entry for this worker.
     current_mutated: Option<Uuid>,
     /// Config
@@ -296,16 +316,6 @@ impl WorkerCorpus {
         fuzzed_function: Option<&Function>,
         fuzzed_contracts: Option<&FuzzRunIdentifiedContracts>,
     ) -> Result<Self> {
-        let mutation_generator = prop_oneof![
-            Just(MutationType::Splice),
-            Just(MutationType::Repeat),
-            Just(MutationType::Interleave),
-            Just(MutationType::Prefix),
-            Just(MutationType::Suffix),
-            Just(MutationType::Abi),
-        ]
-        .boxed();
-
         let worker_dir = config.corpus_dir.as_ref().map(|corpus_dir| {
             let worker_dir = corpus_dir.join(format!("{WORKER}{id}"));
             let worker_corpus = worker_dir.join(CORPUS_DIR);
@@ -415,7 +425,6 @@ impl WorkerCorpus {
             failed_replays,
             metrics,
             tx_generator,
-            mutation_generator,
             current_mutated: None,
             config: config.into(),
             new_entry_indices: Default::default(),
@@ -588,11 +597,7 @@ impl WorkerCorpus {
         if !self.in_memory_corpus.is_empty() {
             self.evict_oldest_corpus()?;
 
-            let mutation_type = self
-                .mutation_generator
-                .new_tree(test_runner)
-                .map_err(|err| eyre!("Could not generate mutation type {err}"))?
-                .current();
+            let mutation_type = weighted_mutation(test_runner.rng())?;
 
             let rng = test_runner.rng();
             let corpus_len = self.in_memory_corpus.len();
@@ -674,12 +679,14 @@ impl WorkerCorpus {
 
                     new_seq = corpus.tx_seq.clone();
 
-                    let idx = rng.random_range(0..new_seq.len());
-                    let tx = new_seq.get_mut(idx).unwrap();
-                    if let (_, Some(function)) = targets.fuzzed_artifacts(tx) {
-                        // TODO: add call_value to call details and mutate it as well as sender some
-                        // of the time.
-                        if !function.inputs.is_empty() {
+                    let mut indices = (0..new_seq.len()).collect::<Vec<_>>();
+                    indices.shuffle(rng);
+
+                    for idx in indices.into_iter().take(abi_mutation_count(new_seq.len(), rng)) {
+                        let tx = &mut new_seq[idx];
+                        if let (_, Some(function)) = targets.fuzzed_artifacts(tx)
+                            && !function.inputs.is_empty()
+                        {
                             self.abi_mutate(tx, function, test_runner, fuzz_state)?;
                         }
                     }
@@ -801,7 +808,26 @@ impl WorkerCorpus {
         test_runner: &mut TestRunner,
         fuzz_state: &EvmFuzzState,
     ) -> Result<()> {
-        // let rng = test_runner.rng();
+        // Mutate sender with 15% probability using addresses from dictionary.
+        if test_runner.rng().random_ratio(15, 100) {
+            let dict = fuzz_state.dictionary_read();
+            let addresses = dict.addresses();
+            if !addresses.is_empty() {
+                let idx = test_runner.rng().random_range(0..addresses.len());
+                if let Some(&addr) = addresses.get_index(idx) {
+                    tx.sender = addr;
+                }
+            }
+        }
+
+        // Mutate value with 15% probability for payable functions.
+        if function.state_mutability == alloy_json_abi::StateMutability::Payable
+            && test_runner.rng().random_ratio(15, 100)
+        {
+            tx.call_details.value = Some(generate_msg_value(test_runner));
+        }
+
+        // Mutate calldata.
         let mut arg_mutation_rounds =
             test_runner.rng().random_range(0..=function.inputs.len()).max(1);
         let round_arg_idx: Vec<usize> = if function.inputs.len() <= 1 {
@@ -1218,6 +1244,7 @@ mod tests {
             call_details: foundry_evm_fuzz::CallDetails {
                 target: Address::ZERO,
                 calldata: Bytes::new(),
+                value: None,
             },
         }
     }
@@ -1250,7 +1277,6 @@ mod tests {
         let manager = WorkerCorpus {
             id: 0,
             tx_generator: tx_gen,
-            mutation_generator: Just(MutationType::Repeat).boxed(),
             config: config.into(),
             in_memory_corpus: vec![corpus],
             current_mutated: Some(seed_uuid),
@@ -1360,7 +1386,6 @@ mod tests {
         let mut manager = WorkerCorpus {
             id: 0,
             tx_generator: tx_gen,
-            mutation_generator: Just(MutationType::Repeat).boxed(),
             config: config.into(),
             in_memory_corpus: vec![favored, non_favored],
             current_mutated: None,

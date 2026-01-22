@@ -1324,9 +1324,28 @@ pub(crate) fn execute_tx<FEN: FoundryEvmNetwork>(
         }
     }
 
-    executor
-        .call_raw(tx.sender, tx.call_details.target, tx.call_details.calldata.clone(), U256::ZERO)
-        .map_err(|e| eyre!(format!("Could not make raw evm call: {e}")))
+    let requested_value = tx.call_details.value.unwrap_or(U256::ZERO);
+    let sender_balance = executor.get_balance(tx.sender)?;
+    let value = if requested_value <= sender_balance {
+        requested_value
+    } else if sender_balance > U256::ZERO {
+        requested_value % sender_balance
+    } else {
+        U256::ZERO
+    };
+
+    let mut call_result = executor
+        .call_raw(tx.sender, tx.call_details.target, tx.call_details.calldata.clone(), value)
+        .map_err(|e| eyre!(format!("Could not make raw evm call: {e}")))?;
+
+    // Propagate block adjustments to call result which will be committed.
+    if warp > 0 || roll > 0 {
+        let ts = call_result.env.evm_env.block_env.timestamp();
+        let num = call_result.env.evm_env.block_env.number();
+        call_result.env.evm_env.block_env.set_timestamp(ts + warp);
+        call_result.env.evm_env.block_env.set_number(num + roll);
+    }
+    Ok(call_result)
 }
 
 #[cfg(test)]
