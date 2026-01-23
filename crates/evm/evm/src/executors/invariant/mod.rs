@@ -253,6 +253,8 @@ struct InvariantTest<FEN: FoundryEvmNetwork> {
     fuzz_state: EvmFuzzState,
     // Contracts fuzzed by the invariant test.
     targeted_contracts: FuzzRunIdentifiedContracts,
+    // Sender filters (targeted/excluded senders).
+    sender_filters: SenderFilters,
     // Data collected during invariant runs.
     test_data: InvariantTestData<FEN>,
 }
@@ -262,6 +264,7 @@ impl<FEN: FoundryEvmNetwork> InvariantTest<FEN> {
     fn new(
         fuzz_state: EvmFuzzState,
         targeted_contracts: FuzzRunIdentifiedContracts,
+        sender_filters: SenderFilters,
         failures: InvariantFailures,
         last_call_results: Option<RawCallResult<FEN>>,
         branch_runner: TestRunner,
@@ -282,7 +285,7 @@ impl<FEN: FoundryEvmNetwork> InvariantTest<FEN> {
             optimization_best_value: None,
             optimization_best_sequence: vec![],
         };
-        Self { fuzz_state, targeted_contracts, test_data }
+        Self { fuzz_state, targeted_contracts, sender_filters, test_data }
     }
 
     /// Returns number of invariant test reverts.
@@ -485,6 +488,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                 &mut invariant_test.test_data.branch_runner,
                 &invariant_test.fuzz_state,
                 &invariant_test.targeted_contracts,
+                Some(&invariant_test.sender_filters),
             )?;
 
             // Create current invariant run data.
@@ -789,13 +793,13 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
     ) -> Result<(InvariantTest<FEN>, WorkerCorpus)> {
         // Finds out the chosen deployed contracts and/or senders.
         self.select_contract_artifacts(invariant_contract.address)?;
-        let (targeted_senders, targeted_contracts) =
+        let (sender_filters, targeted_contracts) =
             self.select_contracts_and_senders(invariant_contract.address)?;
 
         // Creates the invariant strategy.
         let strategy = invariant_strat(
             fuzz_state.clone(),
-            targeted_senders,
+            sender_filters.clone(),
             targeted_contracts.clone(),
             self.config.clone(),
             fuzz_fixtures.clone(),
@@ -878,6 +882,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
         let mut invariant_test = InvariantTest::new(
             fuzz_state,
             targeted_contracts,
+            sender_filters,
             failures,
             last_call_results,
             self.runner.clone(),
