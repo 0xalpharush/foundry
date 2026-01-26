@@ -1298,7 +1298,8 @@ pub(crate) fn call_invariant_function<FEN: FoundryEvmNetwork>(
 }
 
 /// Executes a fuzz call and returns the result.
-/// Applies any block timestamp (warp) and block number (roll) adjustments before the call.
+/// Applies any block timestamp (warp), block number (roll), and balance (deal) adjustments before
+/// the call.
 pub(crate) fn execute_tx<FEN: FoundryEvmNetwork>(
     executor: &mut Executor<FEN>,
     tx: &BasicTxDetails,
@@ -1330,13 +1331,22 @@ pub(crate) fn execute_tx<FEN: FoundryEvmNetwork>(
     }
 
     let requested_value = tx.call_details.value.unwrap_or(U256::ZERO);
-    let sender_balance = executor.get_balance(tx.sender)?;
-    let value = if requested_value <= sender_balance {
-        requested_value
-    } else if sender_balance > U256::ZERO {
-        requested_value % sender_balance
-    } else {
+    let value = if requested_value.is_zero() {
         U256::ZERO
+    } else {
+        if let Some(deal) = tx.deal {
+            let current_balance = executor.get_balance(tx.sender)?;
+            executor.set_balance(tx.sender, current_balance + deal)?;
+        }
+
+        let sender_balance = executor.get_balance(tx.sender)?;
+        if requested_value <= sender_balance {
+            requested_value
+        } else if sender_balance > U256::ZERO {
+            requested_value % sender_balance
+        } else {
+            U256::ZERO
+        }
     };
 
     let mut call_result = executor

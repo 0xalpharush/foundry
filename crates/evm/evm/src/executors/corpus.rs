@@ -1255,6 +1255,7 @@ mod tests {
         BasicTxDetails {
             warp: None,
             roll: None,
+            deal: None,
             sender: Address::ZERO,
             call_details: foundry_evm_fuzz::CallDetails {
                 target: Address::ZERO,
