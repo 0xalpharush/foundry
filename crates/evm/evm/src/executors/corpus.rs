@@ -91,21 +91,21 @@ enum MutationType {
     Repeat,
     /// Interleave calls from two random call sequences.
     Interleave,
-    /// Replace prefix of the original call sequence with new calls.
-    Prefix,
-    /// Replace suffix of the original call sequence with new calls.
-    Suffix,
-    /// ABI mutate random args in a variable number of calls.
-    Abi,
+    /// Generate new calls for a random prefix of the sequence.
+    GenPrefix,
+    /// Generate new calls for a random suffix of the sequence.
+    GenSuffix,
+    /// ABI mutate more than one call when the sequence has enough calls.
+    GenMutate,
 }
 
 const CORPUS_MUTATION_WEIGHTS: &[(MutationType, u32)] = &[
     (MutationType::Splice, 100),
     (MutationType::Repeat, 100),
     (MutationType::Interleave, 100),
-    (MutationType::Prefix, 100),
-    (MutationType::Suffix, 100),
-    (MutationType::Abi, 100),
+    (MutationType::GenPrefix, 100),
+    (MutationType::GenSuffix, 100),
+    (MutationType::GenMutate, 100),
 ];
 
 fn weighted_mutation<R: Rng + ?Sized>(rng: &mut R) -> Result<MutationType> {
@@ -650,30 +650,33 @@ impl WorkerCorpus {
                         new_seq.push(tx);
                     }
                 }
-                MutationType::Prefix => {
+                MutationType::GenPrefix => {
                     let corpus = if rng.random::<bool>() { primary } else { secondary };
-                    trace!(target: "corpus", "overwrite prefix of {}", corpus.uuid);
+                    trace!(target: "corpus", "generate prefix of {}", corpus.uuid);
 
                     self.current_mutated = Some(corpus.uuid);
 
                     new_seq = corpus.tx_seq.clone();
+                    // Generate new calls for a random prefix (0 to all elements).
                     for i in 0..rng.random_range(0..=new_seq.len()) {
                         new_seq[i] = self.new_tx(test_runner)?;
                     }
                 }
-                MutationType::Suffix => {
+                MutationType::GenSuffix => {
                     let corpus = if rng.random::<bool>() { primary } else { secondary };
-                    trace!(target: "corpus", "overwrite suffix of {}", corpus.uuid);
+                    trace!(target: "corpus", "generate suffix of {}", corpus.uuid);
 
                     self.current_mutated = Some(corpus.uuid);
 
                     new_seq = corpus.tx_seq.clone();
-                    for i in new_seq.len() - rng.random_range(0..new_seq.len())..corpus.tx_seq.len()
-                    {
-                        new_seq[i] = self.new_tx(test_runner)?;
+                    // Generate new calls for a random suffix (0 to all elements).
+                    let len = new_seq.len();
+                    let start = len - rng.random_range(0..len);
+                    for tx in new_seq.iter_mut().skip(start) {
+                        *tx = self.new_tx(test_runner)?;
                     }
                 }
-                MutationType::Abi => {
+                MutationType::GenMutate => {
                     let targets = targeted_contracts.targets.lock();
                     let corpus = if rng.random::<bool>() { primary } else { secondary };
                     trace!(target: "corpus", "ABI mutate args of {}", corpus.uuid);
