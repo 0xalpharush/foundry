@@ -97,6 +97,14 @@ enum MutationType {
     GenSuffix,
     /// ABI mutate more than one call when the sequence has enough calls.
     GenMutate,
+    /// Replace prefix of the original call sequence with mutated calls.
+    MutatePrefix,
+    /// Replace suffix of the original call sequence with mutated calls.
+    MutateSuffix,
+    /// Swap two random calls in the sequence.
+    Swap,
+    /// Delete a random call from the sequence.
+    Delete,
 }
 
 const CORPUS_MUTATION_WEIGHTS: &[(MutationType, u32)] = &[
@@ -106,6 +114,10 @@ const CORPUS_MUTATION_WEIGHTS: &[(MutationType, u32)] = &[
     (MutationType::GenPrefix, 100),
     (MutationType::GenSuffix, 100),
     (MutationType::GenMutate, 100),
+    (MutationType::MutatePrefix, 100),
+    (MutationType::MutateSuffix, 100),
+    (MutationType::Swap, 100),
+    (MutationType::Delete, 100),
 ];
 
 fn weighted_mutation<R: Rng + ?Sized>(rng: &mut R) -> Result<MutationType> {
@@ -633,11 +645,12 @@ impl WorkerCorpus {
                     self.current_mutated = Some(corpus.uuid);
 
                     new_seq = corpus.tx_seq.clone();
-                    let start = rng.random_range(0..corpus.tx_seq.len());
-                    let end = rng.random_range(start..corpus.tx_seq.len());
+                    let repetitions = rng.random_range(1..32); // TODO do we need take max depth into account? 
                     let item_idx = rng.random_range(0..corpus.tx_seq.len());
-                    let repeated = vec![new_seq[item_idx].clone(); end - start];
-                    new_seq.splice(start..end, repeated);
+                    let element = corpus.tx_seq[item_idx].clone();
+                    for i in 0..repetitions {
+                        new_seq.insert(item_idx + i, element.clone());
+                    }
                 }
                 MutationType::Interleave => {
                     trace!(target: "corpus", "interleave {} with {}", primary.uuid, secondary.uuid);
@@ -694,6 +707,61 @@ impl WorkerCorpus {
                             && !function.inputs.is_empty()
                         {
                             self.abi_mutate(tx, function, test_runner, fuzz_state, senders)?;
+                        }
+                    }
+                }
+                MutationType::Swap => {
+                    let corpus = if rng.random::<bool>() { primary } else { secondary };
+                    trace!(target: "corpus", "swap calls in {}", corpus.uuid);
+                    self.current_mutated = Some(corpus.uuid);
+                    new_seq = corpus.tx_seq.clone();
+                    let idx1 = rng.random_range(0..new_seq.len());
+                    let idx2 = rng.random_range(0..new_seq.len());
+                    new_seq.swap(idx1, idx2);
+                }
+                MutationType::Delete => {
+                    let corpus = if rng.random::<bool>() { primary } else { secondary };
+                    trace!(target: "corpus", "delete call in {}", corpus.uuid);
+                    self.current_mutated = Some(corpus.uuid);
+                    new_seq = corpus.tx_seq.clone();
+                    // Leave at least one call in the sequence.
+                    if new_seq.len() > 1 {
+                        let idx = rng.random_range(0..new_seq.len());
+                        new_seq.remove(idx);
+                    }
+                }
+                MutationType::MutatePrefix => {
+                    let targets = targeted_contracts.targets.lock();
+                    let corpus = if rng.random::<bool>() { primary } else { secondary };
+                    trace!(target: "corpus", "mutate prefix of {}", corpus.uuid);
+
+                    self.current_mutated = Some(corpus.uuid);
+
+                    new_seq = corpus.tx_seq.clone();
+                    for i in 0..rng.random_range(0..=new_seq.len()) {
+                        let tx = &mut new_seq[i];
+                        if let (_, Some(function)) = targets.fuzzed_artifacts(tx) {
+                            if !function.inputs.is_empty() {
+                                self.abi_mutate(tx, function, test_runner, fuzz_state, senders)?;
+                            }
+                        }
+                    }
+                }
+                MutationType::MutateSuffix => {
+                    let targets = targeted_contracts.targets.lock();
+                    let corpus = if rng.random::<bool>() { primary } else { secondary };
+                    trace!(target: "corpus", "mutate suffix of {}", corpus.uuid);
+
+                    self.current_mutated = Some(corpus.uuid);
+
+                    new_seq = corpus.tx_seq.clone();
+                    for i in new_seq.len() - rng.random_range(0..new_seq.len())..corpus.tx_seq.len()
+                    {
+                        let tx = &mut new_seq[i];
+                        if let (_, Some(function)) = targets.fuzzed_artifacts(tx) {
+                            if !function.inputs.is_empty() {
+                                self.abi_mutate(tx, function, test_runner, fuzz_state, senders)?;
+                            }
                         }
                     }
                 }
