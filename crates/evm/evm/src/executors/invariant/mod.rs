@@ -499,8 +499,22 @@ impl<'a> InvariantExecutor<'a> {
                         )
                         .map_err(|e| eyre!(e.to_string()))?
                     } else {
-                        // Skip invariant check but still track reverts
-                        if call_result.reverted {
+                        // Skip invariant check but still detect assertion failures
+                        if call_result.is_assert_failure()
+                            || current_run.executor.has_global_failure(&state_changeset)
+                        {
+                            let case_data = error::FailedInvariantCaseData::new(
+                                &invariant_contract,
+                                &self.config,
+                                &invariant_test.targeted_contracts,
+                                &current_run.inputs,
+                                call_result,
+                                &[],
+                            );
+                            invariant_test.test_data.failures.error =
+                                Some(InvariantFuzzError::BrokenInvariant(case_data));
+                            result::RichInvariantResults::new(false, None)
+                        } else if call_result.reverted {
                             invariant_test.test_data.failures.reverts += 1;
                             if self.config.fail_on_revert {
                                 let case_data = error::FailedInvariantCaseData::new(

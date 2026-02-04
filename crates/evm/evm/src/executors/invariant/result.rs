@@ -126,6 +126,29 @@ pub(crate) fn can_continue(
         })
     };
 
+    // Assertion failures always cause test failure regardless of fail_on_revert:
+    // - Panic(0x1): Solidity >=0.8 assert()
+    // - InvalidFEOpcode: legacy Solidity <0.8 assert()
+    // - GLOBAL_FAIL_SLOT: vm.assert* cheatcode failures
+    if call_result.is_assert_failure()
+        || invariant_run.executor.has_global_failure(state_changeset)
+    {
+        let invariant_data = &mut invariant_test.test_data;
+        if invariant_data.failures.error.is_none() {
+            let case_data = FailedInvariantCaseData::new(
+                invariant_contract,
+                invariant_config,
+                &invariant_test.targeted_contracts,
+                &invariant_run.inputs,
+                call_result,
+                &[],
+            );
+            invariant_data.failures.error =
+                Some(InvariantFuzzError::BrokenInvariant(case_data));
+        }
+        return Ok(RichInvariantResults::new(false, None));
+    }
+
     if !call_result.reverted && handlers_succeeded() {
         if let Some(traces) = call_result.traces {
             invariant_run.run_traces.push(traces);

@@ -156,10 +156,16 @@ pub fn check_sequence(
         // Ignore calls reverted with `MAGIC_ASSUME`. This is needed to handle failed scenarios that
         // are replayed with a modified version of test driver (that use new `vm.assume`
         // cheatcodes).
-        if call_result.reverted && fail_on_revert && call_result.result.as_ref() != MAGIC_ASSUME {
-            // Candidate sequence fails test.
-            // We don't have to apply remaining calls to check sequence.
-            return Ok((false, false));
+        if call_result.reverted && call_result.result.as_ref() != MAGIC_ASSUME {
+            if call_result.is_assert_failure() {
+                // Assertion failures always fail the sequence.
+                return Ok((false, false));
+            }
+            if fail_on_revert {
+                // Candidate sequence fails test.
+                // We don't have to apply remaining calls to check sequence.
+                return Ok((false, false));
+            }
         }
     }
 

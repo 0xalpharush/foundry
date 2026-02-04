@@ -67,6 +67,9 @@ pub use trace::TracingExecutor;
 
 const DURATION_BETWEEN_METRICS_REPORT: Duration = Duration::from_secs(5);
 
+/// Panic(uint256) selector: first 4 bytes of keccak256("Panic(uint256)")
+const PANIC_SELECTOR: [u8; 4] = [0x4e, 0x48, 0x7b, 0x71];
+
 sol! {
     interface ITest {
         function setUp() external;
@@ -693,6 +696,22 @@ impl Executor {
         }
     }
 
+    /// Returns true if `GLOBAL_FAIL_SLOT` is set (from `vm.assert*` with `assertions_revert=false`).
+    pub fn has_global_failure(&self, state_changeset: &StateChangeset) -> bool {
+        if let Some(acc) = state_changeset.get(&CHEATCODE_ADDRESS)
+            && let Some(slot) = acc.storage.get(&GLOBAL_FAIL_SLOT)
+            && !slot.present_value().is_zero()
+        {
+            return true;
+        }
+        if let Ok(slot) = self.backend().storage_ref(CHEATCODE_ADDRESS, GLOBAL_FAIL_SLOT)
+            && !slot.is_zero()
+        {
+            return true;
+        }
+        false
+    }
+
     /// Creates the environment to use when executing a transaction in a test context
     ///
     /// If using a backend with cheatcodes, `tx.gas_price` and `block.number` will be overwritten by
@@ -901,6 +920,17 @@ impl Default for RawCallResult {
 }
 
 impl RawCallResult {
+    /// Returns true if this call result is an assertion failure:
+    /// - Panic(0x1) in return data (Solidity >=0.8 `assert()`)
+    /// - InvalidFEOpcode exit reason (legacy Solidity <0.8 `assert()`)
+    pub fn is_assert_failure(&self) -> bool {
+        self.exit_reason == Some(InstructionResult::InvalidFEOpcode)
+            || (self.result.len() == 36
+                && self.result[..4] == PANIC_SELECTOR
+                && self.result[4..35].iter().all(|&b| b == 0)
+                && self.result[35] == 0x01)
+    }
+
     /// Unpacks an EVM result.
     pub fn from_evm_result(r: Result<Self, EvmError>) -> eyre::Result<(Self, Option<String>)> {
         match r {
