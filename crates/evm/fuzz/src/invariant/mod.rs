@@ -263,8 +263,10 @@ impl TargetedContract {
 pub struct InvariantContract<'a> {
     /// Address of the test contract.
     pub address: Address,
-    /// Invariant function present in the test contract.
-    pub invariant_function: &'a Function,
+    /// Invariant function.
+    pub invariant_fn: &'a Function,
+    /// All invariant functions present in the test contract and their fail on revert config.
+    pub invariant_fns: Vec<(&'a Function, bool)>,
     /// If true, `afterInvariant` function is called after each invariant run.
     pub call_after_invariant: bool,
     /// ABI of the test contract.
@@ -275,15 +277,16 @@ impl<'a> InvariantContract<'a> {
     /// Creates a new invariant contract.
     pub fn new(
         address: Address,
-        invariant_function: &'a Function,
+        invariant_fn: &'a Function,
+        invariant_fns: Vec<(&'a Function, bool)>,
         call_after_invariant: bool,
         abi: &'a JsonAbi,
     ) -> Self {
-        Self { address, invariant_function, call_after_invariant, abi }
+        Self { address, invariant_fn, invariant_fns, call_after_invariant, abi }
     }
 
     /// Returns true if this is an optimization mode invariant (returns int256).
     pub fn is_optimization(&self) -> bool {
-        is_optimization_invariant(self.invariant_function)
+        is_optimization_invariant(self.invariant_fn)
     }
 }
