@@ -350,6 +350,10 @@ impl<'a> InvariantExecutor<'a> {
         let timer = FuzzTestTimer::new(self.config.timeout);
         let mut last_metrics_report = Instant::now();
         let mut last_reported_failures = std::collections::HashSet::<FailureKey>::new();
+        let mut last_metrics_calls: u64 = 0;
+        let mut last_metrics_gas: u64 = 0;
+        let mut cumulative_calls: u64 = 0;
+        let mut cumulative_gas: u64 = 0;
         let continue_campaign = |runs: u32| {
             if early_exit.should_stop() {
                 return false;
@@ -452,6 +456,8 @@ impl<'a> InvariantExecutor<'a> {
                     {
                         warn!(target: "forge::test", "{error}");
                     }
+                    cumulative_calls += 1;
+                    cumulative_gas += call_result.gas_used;
                     current_run
                         .fuzz_runs
                         .push(FuzzCase { gas: call_result.gas_used, stipend: call_result.stipend });
@@ -597,6 +603,15 @@ impl<'a> InvariantExecutor<'a> {
                 if edge_coverage_enabled {
                     parts.push(format!("{}", corpus_manager.metrics));
                 }
+                // Add throughput metrics.
+                let elapsed = last_metrics_report.elapsed().as_secs_f64();
+                if elapsed > 0.0 {
+                    let delta_calls = cumulative_calls - last_metrics_calls;
+                    let delta_gas = cumulative_gas - last_metrics_gas;
+                    let tx_s = delta_calls as f64 / elapsed;
+                    let gas_s = delta_gas as f64 / elapsed;
+                    parts.push(format!("\n      {tx_s:.0} tx/s, {gas_s:.0} gas/s"));
+                }
                 progress.set_message(parts.join(""));
             } else if edge_coverage_enabled
                 && last_metrics_report.elapsed() > DURATION_BETWEEN_METRICS_REPORT
@@ -620,10 +635,24 @@ impl<'a> InvariantExecutor<'a> {
                 }
 
                 // Emit pulse event with aggregate metrics.
+                let elapsed = last_metrics_report.elapsed().as_secs_f64();
+                let delta_calls = cumulative_calls - last_metrics_calls;
+                let delta_gas = cumulative_gas - last_metrics_gas;
+                let tx_per_sec = if elapsed > 0.0 { delta_calls as f64 / elapsed } else { 0.0 };
+                let gas_per_sec = if elapsed > 0.0 { delta_gas as f64 / elapsed } else { 0.0 };
+
                 let mut metrics = serde_json::to_value(&corpus_manager.metrics)?;
                 if let Some(obj) = metrics.as_object_mut() {
                     obj.insert("unique_failures".into(), failures.unique_failures().into());
                     obj.insert("failures".into(), failures.total_failures.into());
+                    obj.insert(
+                        "tx/s".into(),
+                        serde_json::Value::Number(serde_json::Number::from(tx_per_sec as u64)),
+                    );
+                    obj.insert(
+                        "gas/s".into(),
+                        serde_json::Value::Number(serde_json::Number::from(gas_per_sec as u64)),
+                    );
                 }
                 let pulse = json!({
                     "timestamp": SystemTime::now()
@@ -634,6 +663,8 @@ impl<'a> InvariantExecutor<'a> {
                 });
                 let _ = sh_println!("{}", serde_json::to_string(&pulse)?);
                 last_metrics_report = Instant::now();
+                last_metrics_calls = cumulative_calls;
+                last_metrics_gas = cumulative_gas;
             }
 
             runs += 1;

@@ -801,10 +801,11 @@ impl<'a> FunctionRunner<'a> {
         let show_solidity = invariant_config.show_solidity;
         let continuous_run = invariant_config.continuous_run;
 
+        let contract_name = self.cr.name.rsplit(':').next().unwrap_or(self.cr.name).to_string();
         let progress = start_fuzz_progress(
             self.cr.progress,
             self.cr.name,
-            &func.name,
+            &contract_name,
             invariant_config.timeout,
             invariant_config.runs,
         );
@@ -876,7 +877,7 @@ impl<'a> FunctionRunner<'a> {
                 );
 
                 if let Some(ref progress) = progress {
-                    progress.set_prefix(format!("{}\n{warn}\n", &func.name));
+                    progress.println(format!("Warning: {warn}"));
                 } else {
                     let _ = sh_warn!("{warn}");
                 }

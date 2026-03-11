@@ -703,6 +703,7 @@ impl TestResult {
             calls: 1,
             reverts: 1,
             unique_failures: 0,
+            total_gas: 0,
             metrics: HashMap::default(),
             failed_corpus_replays: 0,
             optimization_best_value: None,
@@ -723,6 +724,7 @@ impl TestResult {
             calls: 1,
             reverts: 1,
             unique_failures: 1,
+            total_gas: 0,
             metrics: HashMap::default(),
             failed_corpus_replays: 0,
             optimization_best_value: None,
@@ -743,6 +745,7 @@ impl TestResult {
             calls: 0,
             reverts: 0,
             unique_failures: 0,
+            total_gas: 0,
             metrics: HashMap::default(),
             failed_corpus_replays: 0,
             optimization_best_value: None,
@@ -765,11 +768,13 @@ impl TestResult {
         failed_corpus_replays: usize,
         optimization_best_value: Option<I256>,
     ) {
+        let total_gas: u64 = cases.iter().flat_map(|seq| seq.cases().iter()).map(|c| c.gas).sum();
         self.kind = TestKind::Invariant {
             runs: cases.len(),
             calls: cases.iter().map(|sequence| sequence.cases().len()).sum(),
             reverts,
             unique_failures,
+            total_gas,
             metrics,
             failed_corpus_replays,
             optimization_best_value,
@@ -829,7 +834,20 @@ impl TestResult {
 
     /// Formats the test result into a string (for printing).
     pub fn short_result(&self, name: &str) -> String {
-        format!("{self} {name} {}", self.kind.report())
+        let report = self.kind.report();
+        let throughput = if let TestKind::Invariant { calls, total_gas, .. } = &self.kind {
+            let secs = self.duration.as_secs_f64();
+            if secs > 0.0 {
+                let tx_per_sec = *calls as f64 / secs;
+                let gas_per_sec = *total_gas as f64 / secs;
+                format!(" ({tx_per_sec:.0} tx/s, {gas_per_sec:.0} gas/s)")
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+        format!("{self} {name} {report}{throughput}")
     }
 
     /// Merges the given raw call result into `self`.
@@ -860,6 +878,7 @@ pub enum TestKindReport {
         calls: usize,
         reverts: usize,
         unique_failures: usize,
+        total_gas: u64,
         metrics: Map<String, InvariantMetrics>,
         failed_corpus_replays: usize,
         /// For optimization mode (int256 return): the best value achieved. None = check mode.
@@ -893,6 +912,7 @@ impl fmt::Display for TestKindReport {
                 calls,
                 reverts,
                 unique_failures,
+                total_gas: _,
                 metrics: _,
                 failed_corpus_replays,
                 optimization_best_value,
@@ -951,6 +971,8 @@ pub enum TestKind {
         calls: usize,
         reverts: usize,
         unique_failures: usize,
+        /// Total gas consumed across all calls.
+        total_gas: u64,
         metrics: Map<String, InvariantMetrics>,
         failed_corpus_replays: usize,
         /// For optimization mode (int256 return): the best value achieved. None = check mode.
@@ -994,6 +1016,7 @@ impl TestKind {
                 calls,
                 reverts,
                 unique_failures,
+                total_gas,
                 metrics: _,
                 failed_corpus_replays,
                 optimization_best_value,
@@ -1002,6 +1025,7 @@ impl TestKind {
                 calls: *calls,
                 reverts: *reverts,
                 unique_failures: *unique_failures,
+                total_gas: *total_gas,
                 metrics: HashMap::default(),
                 failed_corpus_replays: *failed_corpus_replays,
                 optimization_best_value: *optimization_best_value,
