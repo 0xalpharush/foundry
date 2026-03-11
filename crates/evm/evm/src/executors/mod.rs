@@ -67,6 +67,9 @@ pub use trace::TracingExecutor;
 
 const DURATION_BETWEEN_METRICS_REPORT: Duration = Duration::from_secs(5);
 
+/// Panic(uint256) selector: first 4 bytes of keccak256("Panic(uint256)")
+const PANIC_SELECTOR: [u8; 4] = [0x4e, 0x48, 0x7b, 0x71];
+
 sol! {
     interface ITest {
         function setUp() external;
@@ -91,14 +94,11 @@ sol! {
 #[derive(Clone, Debug)]
 pub struct Executor {
     /// The underlying `revm::Database` that contains the EVM storage.
-    ///
-    /// Wrapped in `Arc` for efficient cloning during parallel fuzzing. Use [`Arc::make_mut`]
-    /// for copy-on-write semantics when mutation is needed.
     // Note: We do not store an EVM here, since we are really
     // only interested in the database. REVM's `EVM` is a thin
     // wrapper around spawning a new EVM on every call anyway,
     // so the performance difference should be negligible.
-    backend: Arc<Backend>,
+    backend: Backend,
     /// The EVM environment.
     env: Env,
     /// The Revm inspector stack.
@@ -110,6 +110,12 @@ pub struct Executor {
 }
 
 impl Executor {
+    /// Creates a new `ExecutorBuilder`.
+    #[inline]
+    pub fn builder() -> ExecutorBuilder {
+        ExecutorBuilder::new()
+    }
+
     /// Creates a new `Executor` with the given arguments.
     #[inline]
     pub fn new(
@@ -132,7 +138,7 @@ impl Executor {
             },
         );
 
-        Self { backend: Arc::new(backend), env, inspector, gas_limit, legacy_assertions }
+        Self { backend, env, inspector, gas_limit, legacy_assertions }
     }
 
     fn clone_with_backend(&self, backend: Backend) -> Self {
@@ -142,13 +148,7 @@ impl Executor {
             self.env.tx.clone(),
             self.spec_id(),
         );
-        Self {
-            backend: Arc::new(backend),
-            env,
-            inspector: self.inspector().clone(),
-            gas_limit: self.gas_limit,
-            legacy_assertions: self.legacy_assertions,
-        }
+        Self::new(backend, env, self.inspector().clone(), self.gas_limit, self.legacy_assertions)
     }
 
     /// Returns a reference to the EVM backend.
@@ -157,11 +157,8 @@ impl Executor {
     }
 
     /// Returns a mutable reference to the EVM backend.
-    ///
-    /// Uses copy-on-write semantics: if other clones of this executor share the backend,
-    /// this will clone the backend first.
     pub fn backend_mut(&mut self) -> &mut Backend {
-        Arc::make_mut(&mut self.backend)
+        &mut self.backend
     }
 
     /// Returns a reference to the EVM environment.
@@ -699,19 +696,17 @@ impl Executor {
         }
     }
 
-    /// Returns `true` if the `GLOBAL_FAIL_SLOT` is set, indicating a global failure
-    /// (e.g. from `vm.assert*` cheatcodes with `assertions_revert=false`).
+    /// Returns true if `GLOBAL_FAIL_SLOT` is set (from `vm.assert*` with
+    /// `assertions_revert=false`).
     pub fn has_global_failure(&self, state_changeset: &StateChangeset) -> bool {
-        // Check in the changeset first (uncommitted state).
         if let Some(acc) = state_changeset.get(&CHEATCODE_ADDRESS)
-            && let Some(failed_slot) = acc.storage.get(&GLOBAL_FAIL_SLOT)
-            && !failed_slot.present_value().is_zero()
+            && let Some(slot) = acc.storage.get(&GLOBAL_FAIL_SLOT)
+            && !slot.present_value().is_zero()
         {
             return true;
         }
-        // Then check committed state in the backend.
-        if let Ok(failed_slot) = self.backend().storage_ref(CHEATCODE_ADDRESS, GLOBAL_FAIL_SLOT)
-            && !failed_slot.is_zero()
+        if let Ok(slot) = self.backend().storage_ref(CHEATCODE_ADDRESS, GLOBAL_FAIL_SLOT)
+            && !slot.is_zero()
         {
             return true;
         }
@@ -855,7 +850,7 @@ impl From<DeployResult> for RawCallResult {
 }
 
 /// The result of a raw call.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RawCallResult {
     /// The status of the call
     pub exit_reason: Option<InstructionResult>,
@@ -926,6 +921,17 @@ impl Default for RawCallResult {
 }
 
 impl RawCallResult {
+    /// Returns true if this call result is an assertion failure:
+    /// - Panic(0x1) in return data (Solidity >=0.8 `assert()`)
+    /// - InvalidFEOpcode exit reason (legacy Solidity <0.8 `assert()`)
+    pub fn is_assert_failure(&self) -> bool {
+        self.exit_reason == Some(InstructionResult::InvalidFEOpcode)
+            || (self.result.len() == 36
+                && self.result[..4] == PANIC_SELECTOR
+                && self.result[4..35].iter().all(|&b| b == 0)
+                && self.result[35] == 0x01)
+    }
+
     /// Unpacks an EVM result.
     pub fn from_evm_result(r: Result<Self, EvmError>) -> eyre::Result<(Self, Option<String>)> {
         match r {
@@ -958,21 +964,6 @@ impl RawCallResult {
         } else {
             Err(self.into_evm_error(rd))
         }
-    }
-
-    /// Returns `true` if this call result represents a Solidity assertion failure.
-    ///
-    /// Detects two forms:
-    /// - `Panic(0x01)` (Solidity >=0.8 `assert()`)
-    /// - `InvalidFEOpcode` (legacy Solidity <0.8 `assert()`)
-    pub fn is_assert_failure(&self) -> bool {
-        const PANIC_SELECTOR: [u8; 4] = [0x4e, 0x48, 0x7b, 0x71];
-
-        self.exit_reason == Some(InstructionResult::InvalidFEOpcode)
-            || (self.result.len() == 36
-                && self.result[..4] == PANIC_SELECTOR
-                && self.result[4..35].iter().all(|&b| b == 0)
-                && self.result[35] == 0x01)
     }
 
     /// Decodes the result of the call with the given function.
@@ -1037,6 +1028,51 @@ impl RawCallResult {
             }
         }
         (new_coverage, is_edge)
+    }
+
+    /// Returns (new_coverage_found, is_new_edge, edges_hit)
+    pub fn merge_edge_coverage_detailed(
+        &mut self,
+        history_map: &mut [u8],
+    ) -> (bool, bool, Vec<usize>) {
+        let mut edges_hit = Vec::new();
+        let mut new_coverage = false;
+        let mut is_edge = false;
+
+        if let Some(coverage_map) = &self.edge_coverage {
+            for (idx, &hit_count) in coverage_map.iter().enumerate() {
+                if hit_count > 0 {
+                    edges_hit.push(idx);
+
+                    // Convert hitcount into bucket count
+                    let bucket = match hit_count {
+                        0 => 0,
+                        1 => 1,
+                        2 => 2,
+                        3 => 4,
+                        4..=7 => 8,
+                        8..=15 => 16,
+                        16..=31 => 32,
+                        32..=127 => 64,
+                        _ => 128,
+                    };
+                    let prev_bucket = history_map[idx];
+
+                    if prev_bucket == 0 {
+                        // New edge entirely
+                        new_coverage = true;
+                        is_edge = true;
+                        history_map[idx] = bucket;
+                    } else if bucket > prev_bucket {
+                        // New hit count bucket (feature)
+                        new_coverage = true;
+                        history_map[idx] = bucket;
+                    }
+                }
+            }
+        }
+
+        (new_coverage, is_edge, edges_hit)
     }
 }
 

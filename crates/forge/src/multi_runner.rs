@@ -194,6 +194,12 @@ impl MultiContractRunner {
             find_time,
         );
 
+        // Count contracts with invariant tests so workers can be divided among them.
+        let num_invariant_contracts = contracts
+            .iter()
+            .filter(|(_, c)| c.abi.functions().any(|f| f.is_invariant_test()))
+            .count();
+
         if show_progress {
             let tests_progress = TestsProgress::new(contracts.len(), rayon::current_num_threads());
             // Collect test suite results to stream at the end of test run.
@@ -210,6 +216,7 @@ impl MultiContractRunner {
                         filter,
                         &tokio_handle,
                         Some(&tests_progress),
+                        num_invariant_contracts,
                     );
 
                     tests_progress
@@ -229,7 +236,15 @@ impl MultiContractRunner {
         } else {
             contracts.par_iter().for_each(|&(id, contract)| {
                 let _guard = tokio_handle.enter();
-                let result = self.run_test_suite(id, contract, &db, filter, &tokio_handle, None);
+                let result = self.run_test_suite(
+                    id,
+                    contract,
+                    &db,
+                    filter,
+                    &tokio_handle,
+                    None,
+                    num_invariant_contracts,
+                );
                 let _ = tx.send((id.identifier(), result));
             })
         }
@@ -245,6 +260,7 @@ impl MultiContractRunner {
         filter: &dyn TestFilter,
         tokio_handle: &tokio::runtime::Handle,
         progress: Option<&TestsProgress>,
+        num_invariant_contracts: usize,
     ) -> SuiteResult {
         let identifier = artifact_id.identifier();
         let mut span_name = identifier.as_str();
@@ -272,6 +288,7 @@ impl MultiContractRunner {
             tokio_handle,
             span,
             self,
+            num_invariant_contracts,
         );
         let r = runner.run_tests(filter);
 

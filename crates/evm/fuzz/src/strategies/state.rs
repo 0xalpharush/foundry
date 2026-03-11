@@ -76,6 +76,15 @@ impl EvmFuzzState {
         }
     }
 
+    /// Creates an isolated copy with its own `RwLock<FuzzDictionary>`.
+    pub fn fork(&self) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(self.inner.read().clone())),
+            deployed_libs: self.deployed_libs.clone(),
+            mapping_slots: self.mapping_slots.clone(),
+        }
+    }
+
     pub fn with_mapping_slots(mut self, mapping_slots: AddressMap<MappingSlots>) -> Self {
         self.mapping_slots = Some(mapping_slots);
         self
@@ -141,6 +150,7 @@ impl EvmFuzzState {
 
 // We're using `IndexSet` to have a stable element order when restoring persisted state, as well as
 // for performance when iterating over the sets.
+#[derive(Clone)]
 pub struct FuzzDictionary {
     /// Collected state values.
     state_values: B256IndexSet,

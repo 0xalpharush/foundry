@@ -72,6 +72,8 @@ pub struct ContractRunner<'a> {
     tcfg: Cow<'a, TestRunnerConfig>,
     /// The parent runner.
     mcr: &'a MultiContractRunner,
+    /// Number of invariant contracts in the test suite (for dividing workers).
+    num_invariant_contracts: usize,
 }
 
 impl<'a> std::ops::Deref for ContractRunner<'a> {
@@ -92,6 +94,7 @@ impl<'a> ContractRunner<'a> {
         tokio_handle: &'a tokio::runtime::Handle,
         span: Span,
         mcr: &'a MultiContractRunner,
+        num_invariant_contracts: usize,
     ) -> Self {
         Self {
             name,
@@ -102,6 +105,7 @@ impl<'a> ContractRunner<'a> {
             span,
             tcfg: Cow::Borrowed(&mcr.tcfg),
             mcr,
+            num_invariant_contracts,
         }
     }
 
@@ -422,10 +426,51 @@ impl<'a> ContractRunner<'a> {
             });
         }
 
-        let test_results = functions
+        // Split into invariant and non-invariant tests. The invariant campaign manages its
+        // own rayon workers internally, so run it on the main thread to avoid nested parallelism.
+        let (invariant_tests, other_tests): (Vec<&&Function>, Vec<&&Function>) =
+            functions.iter().partition(|func| func.is_invariant_test());
+
+        let mut test_results = BTreeMap::new();
+
+        // Run invariant campaign on the main thread (it spawns its own rayon workers).
+        for &func in &invariant_tests {
+            if early_exit.should_stop() {
+                break;
+            }
+
+            let test_start = Instant::now();
+            let kind = func.test_function_kind();
+            let test_key = self.name.rsplit(':').next().unwrap_or(self.name).to_string();
+
+            let _guard = debug_span!(
+                "test",
+                %kind,
+                name = %if enabled!(tracing::Level::TRACE) { &test_key } else { &func.name },
+            )
+            .entered();
+
+            let mut res = FunctionRunner::new(&self, &setup).run(
+                func,
+                invariant_fns.clone(),
+                kind,
+                call_after_invariant,
+                identified_contracts.as_ref(),
+            );
+            res.duration = test_start.elapsed();
+
+            if res.status.is_failure() {
+                early_exit.record_failure();
+            }
+
+            test_results.insert(test_key, res);
+        }
+
+        // Run remaining tests in parallel via rayon.
+        let other_results: BTreeMap<_, _> = other_tests
             .par_iter()
             .filter_map(|&func| {
-                // Early exit if we're running with fail-fast and a test already failed.
+                let func = *func;
                 if early_exit.should_stop() {
                     return None;
                 }
@@ -441,12 +486,7 @@ impl<'a> ContractRunner<'a> {
                 }
 
                 let kind = func.test_function_kind();
-                // For invariant tests, use contract name as the test key (1 test per contract).
-                let test_key = if func.is_invariant_test() {
-                    self.name.rsplit(':').next().unwrap_or(self.name).to_string()
-                } else {
-                    func.signature()
-                };
+                let test_key = func.signature();
 
                 let _guard = debug_span!(
                     "test",
@@ -464,14 +504,15 @@ impl<'a> ContractRunner<'a> {
                 );
                 res.duration = start.elapsed();
 
-                // Record test failure for early exit (only triggers if fail-fast is enabled).
                 if res.status.is_failure() {
                     early_exit.record_failure();
                 }
 
                 Some((test_key, res))
             })
-            .collect::<BTreeMap<_, _>>();
+            .collect();
+
+        test_results.extend(other_results);
 
         let duration = start.elapsed();
         SuiteResult::new(duration, test_results, warnings)
@@ -776,11 +817,13 @@ impl<'a> FunctionRunner<'a> {
             .inspector_mut()
             .collect_edge_coverage(invariant_config.corpus.collect_edge_coverage());
         let mut config = invariant_config.clone();
-        let (failure_dir, _failure_file) = test_paths(
-            &mut config.corpus,
-            invariant_config.failure_persist_dir.clone().unwrap(),
-            self.cr.name,
-            &func.name,
+        let contract = self.cr.name.split(':').next_back().unwrap();
+        if let Some(corpus_dir) = &config.corpus.corpus_dir {
+            config.corpus.corpus_dir =
+                Some(foundry_compilers::utils::canonicalized(corpus_dir.join(contract)));
+        }
+        let failure_dir = foundry_compilers::utils::canonicalized(
+            invariant_config.failure_persist_dir.clone().unwrap().join("failures").join(contract),
         );
 
         let mut evm = InvariantExecutor::new(
@@ -789,6 +832,7 @@ impl<'a> FunctionRunner<'a> {
             config,
             identified_contracts,
             &self.cr.mcr.known_contracts,
+            self.cr.num_invariant_contracts,
         );
 
         let invariant_contract = InvariantContract {
@@ -937,6 +981,7 @@ impl<'a> FunctionRunner<'a> {
             progress.as_ref(),
             &self.tcfg.early_exit,
             target_name,
+            self.cr.tokio_handle,
         ) {
             Ok(x) => x,
             Err(e) => {
