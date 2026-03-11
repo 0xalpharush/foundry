@@ -1031,22 +1031,35 @@ impl RawCallResult {
     }
 
     /// Returns (new_coverage_found, is_new_edge, edges_hit)
+    ///
+    /// Scans the coverage map in u64 chunks to skip zero regions fast,
+    /// and only collects `edges_hit` when new coverage is actually found.
     pub fn merge_edge_coverage_detailed(
         &mut self,
         history_map: &mut [u8],
     ) -> (bool, bool, Vec<usize>) {
-        let mut edges_hit = Vec::new();
         let mut new_coverage = false;
         let mut is_edge = false;
 
-        if let Some(coverage_map) = &self.edge_coverage {
-            for (idx, &hit_count) in coverage_map.iter().enumerate() {
-                if hit_count > 0 {
-                    edges_hit.push(idx);
+        let Some(coverage_map) = &self.edge_coverage else {
+            return (false, false, Vec::new());
+        };
 
-                    // Convert hitcount into bucket count
+        // First pass: merge buckets into history_map, detect new coverage.
+        // Scan in u64 chunks to skip zero regions quickly.
+        let chunks = coverage_map.len() / 8;
+        let cov_u64 =
+            unsafe { std::slice::from_raw_parts(coverage_map.as_ptr() as *const u64, chunks) };
+
+        for (chunk_idx, &word) in cov_u64.iter().enumerate() {
+            if word == 0 {
+                continue;
+            }
+            let base = chunk_idx * 8;
+            for i in 0..8 {
+                let hit_count = coverage_map[base + i];
+                if hit_count > 0 {
                     let bucket = match hit_count {
-                        0 => 0,
                         1 => 1,
                         2 => 2,
                         3 => 4,
@@ -1056,21 +1069,55 @@ impl RawCallResult {
                         32..=127 => 64,
                         _ => 128,
                     };
-                    let prev_bucket = history_map[idx];
-
+                    let prev_bucket = history_map[base + i];
                     if prev_bucket == 0 {
-                        // New edge entirely
                         new_coverage = true;
                         is_edge = true;
-                        history_map[idx] = bucket;
+                        history_map[base + i] = bucket;
                     } else if bucket > prev_bucket {
-                        // New hit count bucket (feature)
                         new_coverage = true;
-                        history_map[idx] = bucket;
+                        history_map[base + i] = bucket;
                     }
                 }
             }
         }
+
+        // Handle remaining bytes not covered by u64 chunks.
+        for idx in (chunks * 8)..coverage_map.len() {
+            let hit_count = coverage_map[idx];
+            if hit_count > 0 {
+                let bucket = match hit_count {
+                    1 => 1,
+                    2 => 2,
+                    3 => 4,
+                    4..=7 => 8,
+                    8..=15 => 16,
+                    16..=31 => 32,
+                    32..=127 => 64,
+                    _ => 128,
+                };
+                let prev_bucket = history_map[idx];
+                if prev_bucket == 0 {
+                    new_coverage = true;
+                    is_edge = true;
+                    history_map[idx] = bucket;
+                } else if bucket > prev_bucket {
+                    new_coverage = true;
+                    history_map[idx] = bucket;
+                }
+            }
+        }
+
+        // Only collect edges_hit if there's new coverage (avoids allocation on the common path).
+        let edges_hit = if new_coverage {
+            coverage_map
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, &h)| if h > 0 { Some(idx) } else { None })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         (new_coverage, is_edge, edges_hit)
     }

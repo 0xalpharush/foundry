@@ -66,6 +66,7 @@ use uuid::Uuid;
 const WORKER: &str = "worker";
 const CORPUS_DIR: &str = "corpus";
 const SYNC_DIR: &str = "sync";
+const LAST_SYNC_FILE: &str = ".last_sync";
 
 const COVERAGE_MAP_SIZE: usize = 65536;
 
@@ -185,8 +186,6 @@ pub(crate) struct GlobalCorpusMetrics {
     cumulative_features_seen: AtomicUsize,
     // Number of corpus entries.
     corpus_count: AtomicUsize,
-    // Number of corpus entries that are favored.
-    favored_items: AtomicUsize,
 }
 
 impl fmt::Display for GlobalCorpusMetrics {
@@ -201,7 +200,6 @@ impl GlobalCorpusMetrics {
             cumulative_edges_seen: self.cumulative_edges_seen.load(Ordering::Relaxed),
             cumulative_features_seen: self.cumulative_features_seen.load(Ordering::Relaxed),
             corpus_count: self.corpus_count.load(Ordering::Relaxed),
-            favored_items: self.favored_items.load(Ordering::Relaxed),
         }
     }
 }
@@ -214,8 +212,6 @@ pub(crate) struct CorpusMetrics {
     cumulative_features_seen: usize,
     // Number of corpus entries.
     corpus_count: usize,
-    // Number of corpus entries that are favored.
-    favored_items: usize, // TODO remove or add to metrics as in-mem corpus count
 }
 
 impl fmt::Display for CorpusMetrics {
@@ -223,18 +219,12 @@ impl fmt::Display for CorpusMetrics {
         writeln!(f)?;
         writeln!(f, "        - cumulative edges seen: {}", self.cumulative_edges_seen)?;
         writeln!(f, "        - cumulative features seen: {}", self.cumulative_features_seen)?;
-        writeln!(f, "        - corpus count: {}", self.corpus_count)?;
-        write!(f, "        - favored items: {}", self.favored_items)?;
+        write!(f, "        - corpus count: {}", self.corpus_count)?;
         Ok(())
     }
 }
 
 impl CorpusMetrics {
-    /// Returns the corpus count.
-    pub fn corpus_count(&self) -> usize {
-        self.corpus_count
-    }
-
     /// Records number of new edges or features explored during the campaign.
     pub fn update_seen(&mut self, is_edge: bool) {
         if is_edge {
@@ -341,7 +331,11 @@ impl WorkerCorpus {
             current_mutated: None,
             config: config.into(),
             new_entry_indices: Default::default(),
-            last_sync_timestamp: 0,
+            last_sync_timestamp: worker_dir
+                .as_ref()
+                .and_then(|d| std::fs::read_to_string(d.join(LAST_SYNC_FILE)).ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0),
             worker_dir,
             last_sync_metrics: Default::default(),
         };
@@ -439,8 +433,8 @@ impl WorkerCorpus {
         // Update top_rated before adding to corpus
         self.update_top_rated(&corpus);
 
-        // Persist to disk.
-        let write_result = corpus.write_to_disk_in(&worker_corpus, self.config.corpus_gzip);
+        // Persist to disk uncompressed during the run (gzip deferred to final export).
+        let write_result = corpus.write_to_disk_in(&worker_corpus, false);
         if let Err(err) = write_result {
             debug!(target: "corpus", %err, "failed to record call sequence {:?}", corpus.tx_seq);
         } else {
@@ -460,6 +454,11 @@ impl WorkerCorpus {
         // them. We want this as it is new coverage and may help reach the other branch.
         self.metrics.corpus_count += 1;
         self.in_memory_corpus.push(corpus);
+    }
+
+    /// Returns the number of entries in the in-memory corpus.
+    pub fn corpus_count(&self) -> usize {
+        self.in_memory_corpus.len()
     }
 
     /// Collects coverage from call result and updates metrics.
@@ -548,9 +547,6 @@ impl WorkerCorpus {
                 }
             }
         }
-
-        // Update metrics.
-        self.metrics.favored_items = self.in_memory_corpus.iter().filter(|c| c.is_favored).count();
 
         self.cull_corpus()
     }
@@ -747,52 +743,50 @@ impl WorkerCorpus {
         Ok(sequence[depth].clone())
     }
 
-    /// Flush the non-favored corpus entries when the corpus size exceeds the minimum.
+    /// Evict all non-favored corpus entries, keeping only the minimum covering set.
     fn cull_corpus(&mut self) -> Result<()> {
-        if self.in_memory_corpus.len() > self.config.corpus_min_size.max(1)
-            && let Some(index) = self.in_memory_corpus.iter().position(|corpus| !corpus.is_favored)
-        {
-            let corpus = &self.in_memory_corpus[index];
-            let evicted_uuid = corpus.uuid;
+        let before = self.in_memory_corpus.len();
+        if before <= self.config.corpus_min_size.max(1) {
+            return Ok(());
+        }
 
-            trace!(target: "corpus", corpus=%serde_json::to_string(&corpus).unwrap(), "evict corpus");
+        let has_non_favored = self.in_memory_corpus.iter().any(|c| !c.is_favored);
+        if !has_non_favored {
+            return Ok(());
+        }
 
-            // Remove corpus from memory.
-            self.in_memory_corpus.remove(index);
+        // Remove all non-favored entries.
+        self.in_memory_corpus.retain(|c| c.is_favored);
 
-            // Adjust the tracked indices.
-            self.new_entry_indices.retain_mut(|i| {
-                if *i > index {
-                    *i -= 1; // Shift indices down.
-                    true // Keep this index.
-                } else {
-                    *i != index // Remove if it's the deleted index, keep otherwise.
-                }
-            });
+        // Clear new_entry_indices — after a cull, indices are stale.
+        self.new_entry_indices.clear();
 
-            // Update top_rated entries that pointed to the evicted corpus
-            for edge_idx in 0..COVERAGE_MAP_SIZE {
-                if let Some((uuid, _)) = self.top_rated[edge_idx] {
-                    if uuid == evicted_uuid {
-                        // Find the next best corpus for this edge
-                        self.top_rated[edge_idx] = self
-                            .in_memory_corpus
-                            .iter()
-                            .filter(|c| c.unique_edges_covered.contains(&edge_idx))
-                            .min_by_key(|c| c.tx_seq.len())
-                            .map(|c| (c.uuid, c.tx_seq.len()));
-
-                        // If we evicted a non-favored corpus, there must be another corpus
-                        // covering this edge (otherwise the evicted corpus would be favored)
-                        assert!(
-                            self.top_rated[edge_idx].is_some(),
-                            "evicted non-favored corpus was the only one covering edge {}",
-                            edge_idx
-                        );
+        // Rebuild top_rated from the surviving corpus.
+        self.top_rated.fill(None);
+        for corpus in &self.in_memory_corpus {
+            for &edge_idx in &corpus.unique_edges_covered {
+                match &mut self.top_rated[edge_idx] {
+                    None => {
+                        self.top_rated[edge_idx] = Some((corpus.uuid, corpus.tx_seq.len()));
+                    }
+                    Some((best_uuid, best_cost)) => {
+                        if corpus.tx_seq.len() < *best_cost {
+                            *best_uuid = corpus.uuid;
+                            *best_cost = corpus.tx_seq.len();
+                        }
                     }
                 }
             }
         }
+
+        trace!(
+            target: "corpus",
+            "culled {} non-favored entries ({} -> {})",
+            before - self.in_memory_corpus.len(),
+            before,
+            self.in_memory_corpus.len(),
+        );
+
         Ok(())
     }
 
@@ -989,7 +983,8 @@ impl WorkerCorpus {
 
         for &index in &self.new_entry_indices {
             let Some(corpus) = self.in_memory_corpus.get(index) else { continue };
-            let file_name = corpus.file_name(self.config.corpus_gzip);
+            // Written uncompressed during the run; use non-gzip file name.
+            let file_name = corpus.file_name(false);
             let file_path = corpus_dir.join(&file_name);
             let sync_path = master_sync_dir.join(&file_name);
             if let Err(err) = std::fs::hard_link(&file_path, &sync_path) {
@@ -1063,11 +1058,7 @@ impl WorkerCorpus {
         // For corpus count and favored items, calculate deltas.
         let corpus_count_delta =
             self.metrics.corpus_count as isize - self.last_sync_metrics.corpus_count as isize;
-        let favored_delta =
-            self.metrics.favored_items as isize - self.last_sync_metrics.favored_items as isize;
-
         // Add delta values to global metrics.
-
         if edges_delta > 0 {
             global_corpus_metrics.cumulative_edges_seen.fetch_add(edges_delta, Ordering::Relaxed);
         }
@@ -1085,16 +1076,6 @@ impl WorkerCorpus {
             global_corpus_metrics
                 .corpus_count
                 .fetch_sub((-corpus_count_delta) as usize, Ordering::Relaxed);
-        }
-
-        if favored_delta > 0 {
-            global_corpus_metrics
-                .favored_items
-                .fetch_add(favored_delta as usize, Ordering::Relaxed);
-        } else if favored_delta < 0 {
-            global_corpus_metrics
-                .favored_items
-                .fetch_sub((-favored_delta) as usize, Ordering::Relaxed);
         }
 
         // Store current metrics as last sync metrics for next delta calculation.
@@ -1130,11 +1111,36 @@ impl WorkerCorpus {
         let last_sync = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         self.last_sync_timestamp = last_sync;
 
+        // Persist to disk so restarts don't re-import already-seen entries.
+        if let Some(worker_dir) = &self.worker_dir {
+            let _ = std::fs::write(worker_dir.join(LAST_SYNC_FILE), last_sync.to_string());
+        }
+
         self.new_entry_indices.clear();
 
         debug!(target: "corpus", last_sync, "synced");
 
         Ok(SyncStats { imported, exported, calibrate_elapsed, export_elapsed })
+    }
+
+    /// Compresses eligible corpus files in the worker's corpus directory.
+    /// Called at the end of the campaign to apply deferred gzip.
+    pub fn compress_corpus(&self) {
+        if !self.config.corpus_gzip {
+            return;
+        }
+        let Some(worker_dir) = &self.worker_dir else { return };
+        let corpus_dir = worker_dir.join(CORPUS_DIR);
+
+        for corpus in &self.in_memory_corpus {
+            if corpus.should_gzip(true) {
+                let json_path = corpus_dir.join(corpus.file_name(false));
+                let gz_path = corpus_dir.join(corpus.file_name(true));
+                if foundry_common::fs::write_json_gzip_file(&gz_path, &corpus.tx_seq).is_ok() {
+                    let _ = std::fs::remove_file(&json_path);
+                }
+            }
+        }
     }
 
     /// Helper to check if a tx can be replayed.
@@ -1352,9 +1358,6 @@ mod tests {
 
         assert!(corpus_a.is_favored, "corpus A should be favored");
         assert!(corpus_b.is_favored, "corpus B should be favored");
-
-        // Verify metrics
-        assert_eq!(manager.metrics.favored_items, 2);
     }
 
     #[test]

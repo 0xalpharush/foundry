@@ -394,9 +394,6 @@ struct InvariantWorkerState {
     optimization_best_sequence: Vec<BasicTxDetails>,
     /// Failed corpus replays.
     failed_corpus_replays: usize,
-    /// Cumulative calls and gas.
-    cumulative_calls: u64,
-    cumulative_gas: u64,
 }
 
 impl InvariantWorkerState {
@@ -413,8 +410,6 @@ impl InvariantWorkerState {
             optimization_best_value: None,
             optimization_best_sequence: vec![],
             failed_corpus_replays: 0,
-            cumulative_calls: 0,
-            cumulative_gas: 0,
         }
     }
 }
@@ -745,6 +740,19 @@ impl<'a> InvariantExecutor<'a> {
                 cumulative_edges.extend(edges);
                 current_run.new_coverage |= new_cov;
 
+                // Save corpus immediately when new coverage is found, capturing
+                // the minimal sequence up to this point rather than the full depth.
+                if new_cov {
+                    corpus_manager.process_inputs(
+                        &current_run.inputs,
+                        true,
+                        std::mem::take(&mut cumulative_edges),
+                    );
+                }
+
+                // Count all calls (including discards) in throughput metrics.
+                counters.add_call(call_result.gas_used);
+
                 if discarded {
                     current_run.inputs.pop();
                     current_run.rejects += 1;
@@ -785,9 +793,6 @@ impl<'a> InvariantExecutor<'a> {
                     {
                         warn!(target: "forge::test", "{error}");
                     }
-                    worker.cumulative_calls += 1;
-                    worker.cumulative_gas += call_result.gas_used;
-                    counters.add_call(call_result.gas_used);
 
                     // Emit pulse/metrics at regular intervals (inside depth loop
                     // so pulses fire even during long runs).
@@ -816,64 +821,50 @@ impl<'a> InvariantExecutor<'a> {
                         // Emit metrics event.
                         let elapsed = last_metrics_report.elapsed().as_secs_f64();
 
+                        // All workers emit local pulse.
+                        let local_calls = counters.calls.load(Ordering::Relaxed);
+                        let local_gas = counters.gas.load(Ordering::Relaxed);
+                        let local_failures = counters.failures.load(Ordering::Relaxed);
+                        let delta_calls = local_calls - last_metrics_calls;
+                        let delta_gas = local_gas - last_metrics_gas;
+                        let tx_per_sec =
+                            if elapsed > 0.0 { delta_calls as f64 / elapsed } else { 0.0 };
+                        let gas_per_sec =
+                            if elapsed > 0.0 { delta_gas as f64 / elapsed } else { 0.0 };
+                        let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+                        let pulse = json!({
+                            "worker_id": worker_id,
+                            "timestamp": ts,
+                            "event": "pulse",
+                            "target": target_name,
+                            "metrics": {
+                                "unique_failures": failures.unique_failures(),
+                                "failures": local_failures,
+                                "corpus_count": corpus_manager.corpus_count(),
+                                "tx/s": tx_per_sec as u64,
+                                "gas/s": gas_per_sec as u64,
+                            },
+                        });
+                        let _ = sh_println!("{}", serde_json::to_string(&pulse)?);
+                        last_metrics_calls = local_calls;
+                        last_metrics_gas = local_gas;
+
+                        // Worker 0 also emits global_metrics aggregated across all workers.
                         if worker_id == 0 {
-                            // Worker 0: global_metrics aggregated across all workers.
                             corpus_manager.sync_metrics(&shared_state.global_corpus_metrics);
                             let (global_calls, global_gas, global_failures) =
                                 shared_state.global_totals();
-                            let delta_calls = global_calls - last_metrics_calls;
-                            let delta_gas = global_gas - last_metrics_gas;
-                            let tx_per_sec =
-                                if elapsed > 0.0 { delta_calls as f64 / elapsed } else { 0.0 };
-                            let gas_per_sec =
-                                if elapsed > 0.0 { delta_gas as f64 / elapsed } else { 0.0 };
-                            let global_corpus = shared_state.global_corpus_metrics.load();
-                            let pulse = json!({
-                                "worker_id": worker_id,
-                                "timestamp": SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)?
-                                    .as_secs(),
+                            let global_event = json!({
+                                "timestamp": ts,
                                 "event": "global_metrics",
                                 "target": target_name,
                                 "metrics": {
                                     "failures": global_failures,
-                                    "corpus_count": global_corpus.corpus_count(),
-                                    "tx/s": tx_per_sec as u64,
-                                    "gas/s": gas_per_sec as u64,
+                                    "tx/s": (global_calls as f64 / elapsed) as u64,
+                                    "gas/s": (global_gas as f64 / elapsed) as u64,
                                 },
                             });
-                            let _ = sh_println!("{}", serde_json::to_string(&pulse)?);
-                            last_metrics_calls = global_calls;
-                            last_metrics_gas = global_gas;
-                        } else {
-                            // Non-zero workers: local pulse with own counters.
-                            let local_calls = counters.calls.load(Ordering::Relaxed);
-                            let local_gas = counters.gas.load(Ordering::Relaxed);
-                            let local_failures = counters.failures.load(Ordering::Relaxed);
-                            let delta_calls = local_calls - last_metrics_calls;
-                            let delta_gas = local_gas - last_metrics_gas;
-                            let tx_per_sec =
-                                if elapsed > 0.0 { delta_calls as f64 / elapsed } else { 0.0 };
-                            let gas_per_sec =
-                                if elapsed > 0.0 { delta_gas as f64 / elapsed } else { 0.0 };
-                            let pulse = json!({
-                                "worker_id": worker_id,
-                                "timestamp": SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)?
-                                    .as_secs(),
-                                "event": "pulse",
-                                "target": target_name,
-                                "metrics": {
-                                    "unique_failures": failures.unique_failures(),
-                                    "failures": local_failures,
-                                    "corpus_count": corpus_manager.metrics.corpus_count(),
-                                    "tx/s": tx_per_sec as u64,
-                                    "gas/s": gas_per_sec as u64,
-                                },
-                            });
-                            let _ = sh_println!("{}", serde_json::to_string(&pulse)?);
-                            last_metrics_calls = local_calls;
-                            last_metrics_gas = local_gas;
+                            let _ = sh_println!("{}", serde_json::to_string(&global_event)?);
                         }
                         last_metrics_report = Instant::now();
                     }
@@ -994,13 +985,6 @@ impl<'a> InvariantExecutor<'a> {
                 )?);
             }
 
-            // Extend corpus with current run data.
-            corpus_manager.process_inputs(
-                &current_run.inputs,
-                current_run.new_coverage,
-                cumulative_edges,
-            );
-
             // Call `afterInvariant` if it is declared.
             if invariant_contract.call_after_invariant {
                 assert_after_invariant(
@@ -1066,6 +1050,9 @@ impl<'a> InvariantExecutor<'a> {
         }
 
         invariant_test.fuzz_state.log_stats();
+
+        // Compress corpus files that were written uncompressed during the run.
+        corpus_manager.compress_corpus();
 
         Ok(worker)
     }
