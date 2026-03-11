@@ -637,7 +637,15 @@ impl<'a> InvariantExecutor<'a> {
         let worker_runs = self.runs_per_worker(worker_id);
         debug!(worker_id, worker_runs, "invariant worker starting");
 
-        let mut last_sync = Instant::now() - SYNC_INTERVAL; // Sync immediately on start.
+        // Stagger syncs: worker 0 syncs immediately to export corpus first,
+        // then other workers sync at evenly spaced offsets so they don't all
+        // hit the filesystem at once. Worker i syncs at i * (interval / num_workers).
+        let sync_offset = if worker_id == 0 {
+            SYNC_INTERVAL
+        } else {
+            SYNC_INTERVAL * worker_id as u32 / self.num_workers as u32
+        };
+        let mut last_sync = Instant::now() - sync_offset;
         let mut last_metrics_report = Instant::now();
         let mut last_reported_failures = std::collections::HashSet::<FailureKey>::new();
         let mut last_metrics_calls: u64 = 0;

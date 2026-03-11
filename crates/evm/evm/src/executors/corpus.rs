@@ -1013,7 +1013,7 @@ impl WorkerCorpus {
         let filtered_master_corpus = read_corpus_dir(&master_corpus_dir)
             .filter(|entry| entry.timestamp > self.last_sync_timestamp)
             .collect::<Vec<_>>();
-        let exported = filtered_master_corpus.len();
+        let mut exported = 0usize;
         for target_worker in 1..num_workers {
             let target_dir = self
                 .config
@@ -1033,6 +1033,10 @@ impl WorkerCorpus {
                 if let Err(err) = std::fs::hard_link(&entry.path, &sync_path) {
                     debug!(target: "corpus", %err, from=?entry.path, to=?sync_path, "failed to distribute corpus");
                     continue;
+                }
+                // Count unique entries exported (only count once per entry, via first worker).
+                if target_worker == 1 {
+                    exported += 1;
                 }
                 trace!(target: "corpus", %name, ?target_dir, "distributed corpus");
             }
