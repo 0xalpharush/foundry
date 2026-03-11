@@ -184,8 +184,8 @@ impl fmt::Display for BaseCounterExample {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Display counterexample as solidity.
         if self.show_solidity
-            && let (Some(sender), Some(contract), Some(address), Some(func_name), Some(args)) =
-                (&self.sender, &self.contract_name, &self.addr, &self.func_name, &self.raw_args)
+            && let (Some(address), Some(func_name), Some(args)) =
+                (&self.addr, &self.func_name, &self.raw_args)
         {
             if let Some(warp) = &self.warp {
                 writeln!(f, "\t\tvm.warp(block.timestamp + {warp});")?;
@@ -193,15 +193,15 @@ impl fmt::Display for BaseCounterExample {
             if let Some(roll) = &self.roll {
                 writeln!(f, "\t\tvm.roll(block.number + {roll});")?;
             }
-            writeln!(f, "\t\tvm.prank({sender});")?;
-            write!(
-                f,
-                "\t\t{}({}).{}({});",
-                contract.split_once(':').map_or(contract.as_str(), |(_, contract)| contract),
-                address,
-                func_name,
-                args
-            )?;
+            if let Some(sender) = &self.sender {
+                writeln!(f, "\t\tvm.prank({sender});")?;
+            }
+            let contract_display = self
+                .contract_name
+                .as_ref()
+                .map(|c| c.split_once(':').map_or(c.as_str(), |(_, name)| name))
+                .unwrap_or("???");
+            write!(f, "\t\t{}({}).{}({});", contract_display, address, func_name, args)?;
 
             return Ok(());
         }

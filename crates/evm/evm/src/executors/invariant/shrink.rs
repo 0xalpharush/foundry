@@ -2,12 +2,22 @@ use crate::executors::{
     EarlyExit, Executor,
     invariant::{call_after_invariant_function, call_invariant_function, execute_tx},
 };
+use alloy_dyn_abi::JsonAbiExt;
 use alloy_primitives::{Address, Bytes, I256, U256};
 use foundry_config::InvariantConfig;
 use foundry_evm_core::constants::MAGIC_ASSUME;
 use foundry_evm_fuzz::{BasicTxDetails, invariant::InvariantContract};
 use indicatif::ProgressBar;
 use proptest::bits::{BitSetLike, VarBitSet};
+
+/// Specifies what type of failure the shrinking should preserve.
+#[derive(Clone, Debug)]
+pub enum FailureTarget<'a> {
+    /// Assertion failure in a handler (detected via revert).
+    Assertion,
+    /// A specific invariant function must fail.
+    Invariant(&'a str),
+}
 
 /// Shrinker for a call sequence failure.
 /// Iterates sequence call sequence top down and removes calls one by one.
@@ -83,17 +93,24 @@ pub(crate) fn shrink_sequence(
     executor: &Executor,
     progress: Option<&ProgressBar>,
     early_exit: &EarlyExit,
+    target: Option<&FailureTarget<'_>>,
 ) -> eyre::Result<Vec<BasicTxDetails>> {
     trace!(target: "forge::test", "Shrinking sequence of {} calls.", calls.len());
 
     reset_shrink_progress(config, progress);
 
-    let target_address = invariant_contract.address;
-    let calldata: Bytes = invariant_contract.invariant_fn.selector().to_vec().into();
     // Special case test: the invariant is *unsatisfiable* - it took 0 calls to
     // break the invariant -- consider emitting a warning.
-    let (_, success) = call_invariant_function(executor, target_address, calldata.clone())?;
-    if !success {
+    let check_result = check_sequence(
+        executor.clone(),
+        calls,
+        vec![],
+        invariant_contract,
+        config.fail_on_revert,
+        config.fail_on_assert,
+        target,
+    )?;
+    if !check_result.0 {
         return Ok(vec![]);
     }
 
@@ -111,10 +128,10 @@ pub(crate) fn shrink_sequence(
             executor.clone(),
             calls,
             shrinker.current().collect(),
-            target_address,
-            calldata.clone(),
+            invariant_contract,
             config.fail_on_revert,
-            invariant_contract.call_after_invariant,
+            config.fail_on_assert,
+            target,
         ) {
             // If candidate sequence still fails, shrink until shortest possible.
             Ok((false, _)) if shrinker.included_calls.count() == 1 => break,
@@ -143,10 +160,10 @@ pub fn check_sequence(
     mut executor: Executor,
     calls: &[BasicTxDetails],
     sequence: Vec<usize>,
-    test_address: Address,
-    calldata: Bytes,
+    invariant_contract: &InvariantContract<'_>,
     fail_on_revert: bool,
-    call_after_invariant: bool,
+    fail_on_assert: bool,
+    target: Option<&FailureTarget<'_>>,
 ) -> eyre::Result<(bool, bool)> {
     // Apply the call sequence.
     for call_index in sequence {
@@ -156,22 +173,64 @@ pub fn check_sequence(
         // Ignore calls reverted with `MAGIC_ASSUME`. This is needed to handle failed scenarios that
         // are replayed with a modified version of test driver (that use new `vm.assume`
         // cheatcodes).
-        if call_result.reverted && fail_on_revert && call_result.result.as_ref() != MAGIC_ASSUME {
-            // Candidate sequence fails test.
-            // We don't have to apply remaining calls to check sequence.
-            return Ok((false, false));
+        if call_result.reverted && call_result.result.as_ref() != MAGIC_ASSUME {
+            if fail_on_assert && call_result.is_assert_failure() {
+                // Only count as failure if we're targeting assertions (or no specific target).
+                match target {
+                    Some(FailureTarget::Invariant(_)) => {} // Skip, looking for invariant failure
+                    _ => return Ok((false, false)),
+                }
+            }
+            if fail_on_revert {
+                match target {
+                    Some(FailureTarget::Invariant(_) | FailureTarget::Assertion) => {}
+                    _ => return Ok((false, false)),
+                }
+            }
         }
     }
 
-    // Check the invariant for call sequence.
-    let (_, mut success) = call_invariant_function(&executor, test_address, calldata)?;
-    // Check after invariant result if invariant is success and `afterInvariant` function is
-    // declared.
-    if success && call_after_invariant {
-        (_, success) = call_after_invariant_function(&executor, test_address)?;
+    // Check invariant functions.
+    match target {
+        Some(FailureTarget::Invariant(fn_name)) => {
+            // Only check the specific invariant function.
+            if let Some((invariant_fn, _)) =
+                invariant_contract.invariant_fns.iter().find(|(f, _)| f.name == *fn_name)
+            {
+                let calldata: Bytes = invariant_fn.abi_encode_input(&[])?.into();
+                let (_, success) =
+                    call_invariant_function(&executor, invariant_contract.address, calldata)?;
+                if !success {
+                    return Ok((false, true));
+                }
+            }
+        }
+        Some(FailureTarget::Assertion) => {
+            // For assertion targets, we already checked during handler replay above.
+            // The sequence passed without hitting an assertion, so it's successful.
+        }
+        None => {
+            // No specific target: check all invariant functions.
+            for (invariant_fn, _fail_on_revert) in &invariant_contract.invariant_fns {
+                let calldata: Bytes = invariant_fn.abi_encode_input(&[])?.into();
+                let (_, success) =
+                    call_invariant_function(&executor, invariant_contract.address, calldata)?;
+                if !success {
+                    return Ok((false, true));
+                }
+            }
+            // Check afterInvariant if all pass.
+            if invariant_contract.call_after_invariant {
+                let (_, success) =
+                    call_after_invariant_function(&executor, invariant_contract.address)?;
+                if !success {
+                    return Ok((false, true));
+                }
+            }
+        }
     }
 
-    Ok((success, true))
+    Ok((true, true))
 }
 
 /// Shrinks a call sequence to the shortest sequence that still produces the target optimization

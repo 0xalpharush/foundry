@@ -128,9 +128,9 @@ impl TestOutcome {
         self.skips().count()
     }
 
-    /// Returns the number of tests that failed.
+    /// Returns the number of failures (using unique_failures for invariant tests).
     pub fn failed(&self) -> usize {
-        self.failures().count()
+        self.failures().map(|(_, t)| t.failure_count()).sum()
     }
 
     /// Returns `true` if any fuzz or invariant test failed.
@@ -169,7 +169,7 @@ impl TestOutcome {
     /// Checks if there are any failures and failures are disallowed.
     pub fn ensure_ok(&self, silent: bool) -> eyre::Result<()> {
         let outcome = self;
-        let failures = outcome.failures().count();
+        let failures = outcome.failed();
         if outcome.allow_failure || failures == 0 {
             return Ok(());
         }
@@ -299,9 +299,9 @@ impl SuiteResult {
         self.skips().count()
     }
 
-    /// Returns the number of tests that failed.
+    /// Returns the number of failures (using unique_failures for invariant tests).
     pub fn failed(&self) -> usize {
-        self.failures().count()
+        self.failures().map(|(_, t)| t.failure_count()).sum()
     }
 
     /// Iterator over all tests and their names
@@ -415,11 +415,12 @@ pub struct TestResult {
     /// still be successful (i.e self.success == true) when it's expected to fail.
     pub reason: Option<String>,
 
-    /// This field will be populated if there are additional invariant broken besides the main one.
-    pub other_failures: Vec<String>,
-
     /// Minimal reproduction test case for failing test
     pub counterexample: Option<CounterExample>,
+
+    /// All invariant failures (reason, counterexample).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub invariant_failures: Vec<(String, CounterExample)>,
 
     /// Any captured & parsed as strings logs along the test's execution which should
     /// be printed to the user.
@@ -494,42 +495,66 @@ impl fmt::Display for TestResult {
                 s.yellow().fmt(f)
             }
             TestStatus::Failure => {
-                let mut s = String::from("[FAIL");
-                if self.reason.is_some() || self.counterexample.is_some() {
-                    if let Some(reason) = &self.reason {
-                        write!(s, ": {reason}").unwrap();
-                    }
+                let mut s = String::new();
 
-                    if let Some(counterexample) = &self.counterexample {
+                // Display invariant failures if present, otherwise standard
+                // reason+counterexample.
+                if !self.invariant_failures.is_empty() {
+                    for (i, (reason, counterexample)) in self.invariant_failures.iter().enumerate()
+                    {
+                        if i > 0 {
+                            s.push_str("\n\n");
+                        }
+                        write!(s, "[FAIL: {reason}]").unwrap();
                         match counterexample {
                             CounterExample::Single(ex) => {
-                                write!(s, "; counterexample: {ex}]").unwrap();
+                                write!(s, " counterexample: {ex}").unwrap();
                             }
                             CounterExample::Sequence(original, sequence) => {
-                                s.push_str(
-                                    format!(
-                                        "]\n\t[Sequence] (original: {original}, shrunk: {})\n",
-                                        sequence.len()
-                                    )
-                                    .as_str(),
-                                );
+                                write!(
+                                    s,
+                                    "\n\t[Sequence] (original: {original}, shrunk: {})\n",
+                                    sequence.len()
+                                )
+                                .unwrap();
                                 for ex in sequence {
                                     writeln!(s, "{ex}").unwrap();
                                 }
                             }
                         }
+                    }
+                } else {
+                    s.push_str("[FAIL");
+                    if self.reason.is_some() || self.counterexample.is_some() {
+                        if let Some(reason) = &self.reason {
+                            write!(s, ": {reason}").unwrap();
+                        }
+                        if let Some(counterexample) = &self.counterexample {
+                            match counterexample {
+                                CounterExample::Single(ex) => {
+                                    write!(s, "; counterexample: {ex}]").unwrap();
+                                }
+                                CounterExample::Sequence(original, sequence) => {
+                                    s.push_str(
+                                        format!(
+                                            "]\n\t[Sequence] (original: {original}, shrunk: {})\n",
+                                            sequence.len()
+                                        )
+                                        .as_str(),
+                                    );
+                                    for ex in sequence {
+                                        writeln!(s, "{ex}").unwrap();
+                                    }
+                                }
+                            }
+                        } else {
+                            s.push(']');
+                        }
                     } else {
                         s.push(']');
                     }
-                } else {
-                    s.push(']');
                 }
-                if !self.other_failures.is_empty() {
-                    writeln!(s).unwrap();
-                    for failure in &self.other_failures {
-                        writeln!(s, "{failure}").unwrap();
-                    }
-                }
+
                 s.red().wrap().fmt(f)
             }
         }
@@ -677,6 +702,7 @@ impl TestResult {
             runs: 1,
             calls: 1,
             reverts: 1,
+            unique_failures: 0,
             metrics: HashMap::default(),
             failed_corpus_replays: 0,
             optimization_best_value: None,
@@ -696,6 +722,7 @@ impl TestResult {
             runs: 1,
             calls: 1,
             reverts: 1,
+            unique_failures: 1,
             metrics: HashMap::default(),
             failed_corpus_replays: 0,
             optimization_best_value: None,
@@ -715,6 +742,7 @@ impl TestResult {
             runs: 0,
             calls: 0,
             reverts: 0,
+            unique_failures: 0,
             metrics: HashMap::default(),
             failed_corpus_replays: 0,
             optimization_best_value: None,
@@ -729,11 +757,10 @@ impl TestResult {
         &mut self,
         gas_report_traces: Vec<Vec<CallTraceArena>>,
         success: bool,
-        reason: Option<String>,
-        other_failures: Vec<String>,
-        counterexample: Option<CounterExample>,
+        invariant_failures: Vec<(String, CounterExample)>,
         cases: Vec<FuzzedCases>,
         reverts: usize,
+        unique_failures: usize,
         metrics: Map<String, InvariantMetrics>,
         failed_corpus_replays: usize,
         optimization_best_value: Option<I256>,
@@ -742,6 +769,7 @@ impl TestResult {
             runs: cases.len(),
             calls: cases.iter().map(|sequence| sequence.cases().len()).sum(),
             reverts,
+            unique_failures,
             metrics,
             failed_corpus_replays,
             optimization_best_value,
@@ -752,9 +780,7 @@ impl TestResult {
         } else {
             TestStatus::Failure
         };
-        self.reason = reason;
-        self.other_failures = other_failures;
-        self.counterexample = counterexample;
+        self.invariant_failures = invariant_failures;
         self.gas_report_traces = gas_report_traces;
     }
 
@@ -790,6 +816,17 @@ impl TestResult {
         matches!(self.kind, TestKind::Fuzz { .. })
     }
 
+    /// Returns the number of failures for this test result.
+    /// For invariant tests, returns unique_failures (minimum 1 if failed).
+    /// For other tests, returns 1 if failed.
+    pub fn failure_count(&self) -> usize {
+        if let TestKind::Invariant { unique_failures, .. } = &self.kind {
+            *unique_failures
+        } else {
+            1
+        }
+    }
+
     /// Formats the test result into a string (for printing).
     pub fn short_result(&self, name: &str) -> String {
         format!("{self} {name} {}", self.kind.report())
@@ -822,6 +859,7 @@ pub enum TestKindReport {
         runs: usize,
         calls: usize,
         reverts: usize,
+        unique_failures: usize,
         metrics: Map<String, InvariantMetrics>,
         failed_corpus_replays: usize,
         /// For optimization mode (int256 return): the best value achieved. None = check mode.
@@ -854,6 +892,7 @@ impl fmt::Display for TestKindReport {
                 runs,
                 calls,
                 reverts,
+                unique_failures,
                 metrics: _,
                 failed_corpus_replays,
                 optimization_best_value,
@@ -861,13 +900,15 @@ impl fmt::Display for TestKindReport {
                 // If optimization_best_value is Some, this is optimization mode.
                 if let Some(best_value) = optimization_best_value {
                     write!(f, "(best: {best_value}, runs: {runs}, calls: {calls})")
-                } else if *failed_corpus_replays != 0 {
-                    write!(
-                        f,
-                        "(runs: {runs}, calls: {calls}, reverts: {reverts}, failed corpus replays: {failed_corpus_replays})"
-                    )
                 } else {
-                    write!(f, "(runs: {runs}, calls: {calls}, reverts: {reverts})")
+                    write!(f, "(runs: {runs}, calls: {calls}, reverts: {reverts}")?;
+                    if *unique_failures > 0 {
+                        write!(f, ", failures: {unique_failures}")?;
+                    }
+                    if *failed_corpus_replays != 0 {
+                        write!(f, ", failed corpus replays: {failed_corpus_replays}")?;
+                    }
+                    write!(f, ")")
                 }
             }
             Self::Table { runs, mean_gas, median_gas } => {
@@ -909,6 +950,7 @@ pub enum TestKind {
         runs: usize,
         calls: usize,
         reverts: usize,
+        unique_failures: usize,
         metrics: Map<String, InvariantMetrics>,
         failed_corpus_replays: usize,
         /// For optimization mode (int256 return): the best value achieved. None = check mode.
@@ -951,6 +993,7 @@ impl TestKind {
                 runs,
                 calls,
                 reverts,
+                unique_failures,
                 metrics: _,
                 failed_corpus_replays,
                 optimization_best_value,
@@ -958,6 +1001,7 @@ impl TestKind {
                 runs: *runs,
                 calls: *calls,
                 reverts: *reverts,
+                unique_failures: *unique_failures,
                 metrics: HashMap::default(),
                 failed_corpus_replays: *failed_corpus_replays,
                 optimization_best_value: *optimization_best_value,

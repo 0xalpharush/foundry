@@ -699,6 +699,25 @@ impl Executor {
         }
     }
 
+    /// Returns `true` if the `GLOBAL_FAIL_SLOT` is set, indicating a global failure
+    /// (e.g. from `vm.assert*` cheatcodes with `assertions_revert=false`).
+    pub fn has_global_failure(&self, state_changeset: &StateChangeset) -> bool {
+        // Check in the changeset first (uncommitted state).
+        if let Some(acc) = state_changeset.get(&CHEATCODE_ADDRESS)
+            && let Some(failed_slot) = acc.storage.get(&GLOBAL_FAIL_SLOT)
+            && !failed_slot.present_value().is_zero()
+        {
+            return true;
+        }
+        // Then check committed state in the backend.
+        if let Ok(failed_slot) = self.backend().storage_ref(CHEATCODE_ADDRESS, GLOBAL_FAIL_SLOT)
+            && !failed_slot.is_zero()
+        {
+            return true;
+        }
+        false
+    }
+
     /// Creates the environment to use when executing a transaction in a test context
     ///
     /// If using a backend with cheatcodes, `tx.gas_price` and `block.number` will be overwritten by
@@ -939,6 +958,21 @@ impl RawCallResult {
         } else {
             Err(self.into_evm_error(rd))
         }
+    }
+
+    /// Returns `true` if this call result represents a Solidity assertion failure.
+    ///
+    /// Detects two forms:
+    /// - `Panic(0x01)` (Solidity >=0.8 `assert()`)
+    /// - `InvalidFEOpcode` (legacy Solidity <0.8 `assert()`)
+    pub fn is_assert_failure(&self) -> bool {
+        const PANIC_SELECTOR: [u8; 4] = [0x4e, 0x48, 0x7b, 0x71];
+
+        self.exit_reason == Some(InstructionResult::InvalidFEOpcode)
+            || (self.result.len() == 36
+                && self.result[..4] == PANIC_SELECTOR
+                && self.result[4..35].iter().all(|&b| b == 0)
+                && self.result[35] == 0x01)
     }
 
     /// Decodes the result of the call with the given function.

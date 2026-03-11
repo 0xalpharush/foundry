@@ -1,6 +1,7 @@
 use super::{
-    InvariantFailures, InvariantFuzzError, InvariantMetrics, InvariantTest, InvariantTestRun,
-    call_after_invariant_function, call_invariant_function, error::FailedInvariantCaseData,
+    FailureKey, InvariantFailures, InvariantFuzzError, InvariantMetrics, InvariantTest,
+    InvariantTestRun, call_after_invariant_function, call_invariant_function,
+    error::FailedInvariantCaseData,
 };
 use crate::executors::{Executor, RawCallResult};
 use alloy_dyn_abi::JsonAbiExt;
@@ -20,7 +21,7 @@ use std::{borrow::Cow, collections::HashMap};
 #[derive(Debug)]
 pub struct InvariantFuzzTestResult {
     /// Errors recorded per invariant.
-    pub errors: HashMap<String, InvariantFuzzError>,
+    pub errors: HashMap<FailureKey, InvariantFuzzError>,
     /// Every successful fuzz test case
     pub cases: Vec<FuzzedCases>,
     /// Number of reverted fuzz calls
@@ -53,6 +54,7 @@ pub(crate) fn invariant_preflight_check(
     executor: &Executor,
     calldata: &[BasicTxDetails],
     invariant_failures: &mut InvariantFailures,
+    target_name: &str,
 ) -> Result<()> {
     let (call_result, success) = call_invariant_function(
         executor,
@@ -60,13 +62,13 @@ pub(crate) fn invariant_preflight_check(
         invariant_contract.invariant_fn.abi_encode_input(&[])?.into(),
     )?;
     if !success {
-        // We only care about invariants which we haven't broken yet.
         invariant_failures.record_failure(
-            invariant_contract.invariant_fn,
+            FailureKey::new(target_name, &invariant_contract.invariant_fn.name),
             InvariantFuzzError::BrokenInvariant(FailedInvariantCaseData::new(
                 invariant_contract,
                 invariant_config.shrink_run_limit,
                 invariant_config.fail_on_revert,
+                invariant_config.fail_on_assert,
                 targeted_contracts,
                 calldata,
                 &call_result,
@@ -88,15 +90,10 @@ pub(crate) fn assert_invariants(
     executor: &Executor,
     calldata: &[BasicTxDetails],
     invariant_failures: &mut InvariantFailures,
+    target_name: &str,
 ) -> Result<()> {
     let inner_sequence = invariant_inner_sequence(executor);
-    // We only care about invariants which we haven't broken yet.
     for (invariant, fail_on_revert) in &invariant_contract.invariant_fns {
-        // We only care about invariants which we haven't broken yet.
-        if invariant_failures.has_failure(invariant) {
-            continue;
-        }
-
         let (call_result, success) = call_invariant_function(
             executor,
             invariant_contract.address,
@@ -104,11 +101,12 @@ pub(crate) fn assert_invariants(
         )?;
         if !success {
             invariant_failures.record_failure(
-                invariant,
+                FailureKey::new(target_name, &invariant.name),
                 InvariantFuzzError::BrokenInvariant(FailedInvariantCaseData::new(
                     invariant_contract,
                     invariant_config.shrink_run_limit,
                     *fail_on_revert,
+                    invariant_config.fail_on_assert,
                     targeted_contracts,
                     calldata,
                     &call_result,
@@ -137,14 +135,17 @@ fn invariant_inner_sequence(executor: &Executor) -> Vec<Option<BasicTxDetails>> 
 ///
 /// For optimization mode (int256 return), tracks the max value but never fails on invariant.
 /// For check mode, asserts the invariant and fails if broken.
-pub(crate) fn can_continue(
+/// Processes the result of a handler call: detects assertion failures, checks invariants,
+/// and records any errors found during the campaign.
+pub(crate) fn process_call_result(
     invariant_contract: &InvariantContract<'_>,
     invariant_test: &mut InvariantTest,
     invariant_run: &mut InvariantTestRun,
     invariant_config: &InvariantConfig,
     call_result: RawCallResult,
     state_changeset: &StateChangeset,
-) -> Result<bool> {
+    target_name: &str,
+) -> Result<()> {
     let is_optimization = invariant_contract.is_optimization();
 
     let handlers_succeeded = || {
@@ -157,6 +158,41 @@ pub(crate) fn can_continue(
             )
         })
     };
+
+    // When fail_on_assert is enabled, detect handler-level assertion failures.
+    if invariant_config.fail_on_assert
+        && (call_result.is_assert_failure()
+            || invariant_run.executor.has_global_failure(state_changeset))
+    {
+        let handler_name = invariant_run
+            .inputs
+            .last()
+            .and_then(|last_input| {
+                invariant_test.targeted_contracts.targets.lock().fuzzed_metric_key(last_input).map(
+                    |metric_key| {
+                        metric_key.rsplit('.').next().unwrap_or(metric_key.as_str()).to_string()
+                    },
+                )
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        invariant_test.test_data.failures.reverts += 1;
+        let case_data = FailedInvariantCaseData::new(
+            invariant_contract,
+            invariant_config.shrink_run_limit,
+            invariant_config.fail_on_revert,
+            invariant_config.fail_on_assert,
+            &invariant_test.targeted_contracts,
+            &invariant_run.inputs,
+            &call_result,
+            &[],
+        );
+        invariant_test.test_data.failures.revert_reason = Some(case_data.revert_reason.clone());
+        invariant_test.test_data.failures.record_failure(
+            FailureKey::new(target_name, &handler_name),
+            InvariantFuzzError::BrokenAssertion(case_data),
+        );
+        return Ok(());
+    }
 
     // Assert invariants if the call did not revert and the handlers did not fail.
     if !call_result.reverted && handlers_succeeded() {
@@ -186,6 +222,7 @@ pub(crate) fn can_continue(
                 &invariant_run.executor,
                 &invariant_run.inputs,
                 &mut invariant_test.test_data.failures,
+                target_name,
             )?;
         }
     } else {
@@ -198,16 +235,16 @@ pub(crate) fn can_continue(
                     invariant_contract,
                     invariant_config.shrink_run_limit,
                     *fail_on_revert,
+                    invariant_config.fail_on_assert,
                     &invariant_test.targeted_contracts,
                     &invariant_run.inputs,
                     &call_result,
                     &[],
                 );
-                invariant_test
-                    .test_data
-                    .failures
-                    .errors
-                    .insert(invariant.name.clone(), InvariantFuzzError::Revert(case_data));
+                invariant_test.test_data.failures.record_failure(
+                    FailureKey::new(target_name, &invariant.name),
+                    InvariantFuzzError::Revert(case_data),
+                );
             }
         }
         // Remove last reverted call from inputs.
@@ -218,8 +255,7 @@ pub(crate) fn can_continue(
             invariant_run.inputs.pop();
         }
     }
-    // Stop execution if all invariants are broken.
-    Ok(invariant_test.test_data.failures.can_continue(invariant_contract.invariant_fns.len()))
+    Ok(())
 }
 
 /// Given the executor state, asserts conditions within `afterInvariant` function.
@@ -229,6 +265,7 @@ pub(crate) fn assert_after_invariant(
     invariant_test: &mut InvariantTest,
     invariant_run: &InvariantTestRun,
     invariant_config: &InvariantConfig,
+    target_name: &str,
 ) -> Result<bool> {
     let (call_result, success) =
         call_after_invariant_function(&invariant_run.executor, invariant_contract.address)?;
@@ -238,13 +275,14 @@ pub(crate) fn assert_after_invariant(
             invariant_contract,
             invariant_config.shrink_run_limit,
             invariant_config.fail_on_revert,
+            invariant_config.fail_on_assert,
             &invariant_test.targeted_contracts,
             &invariant_run.inputs,
             &call_result,
             &[],
         );
         invariant_test.set_error(
-            invariant_contract.invariant_fn,
+            FailureKey::new(target_name, &invariant_contract.invariant_fn.name),
             InvariantFuzzError::BrokenInvariant(case_data),
         );
     }
