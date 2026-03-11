@@ -104,11 +104,24 @@ pub fn invariant_strat(
             (warp, roll, deal, sender, call_details)
         })
         .prop_map(move |(warp, roll, deal, sender, call_details)| {
-            let warp =
+            let mut warp =
                 warp.map(|time| time % U256::from(config.max_time_delay.unwrap_or_default()));
-            let roll =
+            let mut roll =
                 roll.map(|block| block % U256::from(config.max_block_delay.unwrap_or_default()));
-            let deal = deal.map(|amount| amount % U256::from(config.max_deal.unwrap_or_default()));
+            let deal = deal.map(|amount| {
+                // max_deal is in ETH, convert to wei (ETH * 10^18).
+                let max_deal_wei = U256::from(config.max_deal.unwrap_or_default())
+                    * U256::from(1_000_000_000_000_000_000u64);
+                amount % max_deal_wei
+            });
+            // Level constraint: if time doesn't advance, block shouldn't either.
+            if warp == Some(U256::ZERO) {
+                roll = Some(U256::ZERO);
+            }
+            // Converse: if block doesn't advance, time shouldn't either.
+            if roll == Some(U256::ZERO) {
+                warp = Some(U256::ZERO);
+            }
             BasicTxDetails { warp, roll, deal, sender, call_details }
         })
 }
@@ -165,8 +178,16 @@ pub fn fuzz_contract_with_calldata(
         40 => fuzz_calldata_from_state(func, fuzz_state),
     ];
 
-    // For payable functions, generate random value using shared strategy.
-    let value_strategy = if is_payable { fuzz_msg_value().boxed() } else { Just(None).boxed() };
+    let value_strategy = if is_payable {
+        fuzz_msg_value().boxed()
+    } else {
+        // 0.1% chance to send value to non-payable functions (catches missing payable modifiers).
+        proptest::prop_oneof![
+            999 => Just(None),
+            1 => (1u64..=1_000_000_000_000_000_000u64).prop_map(|v| Some(U256::from(v))),
+        ]
+        .boxed()
+    };
 
     (calldata_strategy, value_strategy).prop_map(move |(calldata, value)| {
         trace!(input=?calldata, ?value);

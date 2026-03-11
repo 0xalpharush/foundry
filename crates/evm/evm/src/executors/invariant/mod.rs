@@ -626,6 +626,7 @@ impl<'a> InvariantExecutor<'a> {
             Some(&targeted_contracts),
             self.config.max_time_delay,
             self.config.max_block_delay,
+            self.config.gen_weight,
         )?;
 
         // Create own TestRunner. Worker 0 clones the runner as-is for determinism;

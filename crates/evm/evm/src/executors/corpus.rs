@@ -43,7 +43,9 @@ use foundry_config::FuzzCorpusConfig;
 use foundry_evm_fuzz::{
     BasicTxDetails,
     invariant::{FuzzRunIdentifiedContracts, SenderFilters},
-    strategies::{EvmFuzzState, generate_msg_value, mutate_param_value, select_random_sender_for_mutation},
+    strategies::{
+        EvmFuzzState, generate_msg_value, mutate_param_value, select_random_sender_for_mutation,
+    },
 };
 use proptest::{
     prelude::{Just, Rng, Strategy},
@@ -67,7 +69,8 @@ const CORPUS_DIR: &str = "corpus";
 const SYNC_DIR: &str = "sync";
 const LAST_SYNC_FILE: &str = ".last_sync";
 
-const COVERAGE_MAP_SIZE: usize = 65536;
+/// Doubled from 65536 to accommodate success/revert split coverage.
+const COVERAGE_MAP_SIZE: usize = 131072;
 
 /// Threshold for compressing corpus entries.
 /// 4KiB is usually the minimum file size on popular file systems.
@@ -273,6 +276,8 @@ pub struct WorkerCorpus {
     max_time_delay: Option<u32>,
     /// Maximum block delay for roll mutation. None = no roll mutation.
     max_block_delay: Option<u32>,
+    /// Weight (0-100) for generating fresh sequences vs mutating corpus.
+    gen_weight: u32,
     /// Indices of new entries added to [`WorkerCorpus::in_memory_corpus`] since last sync.
     new_entry_indices: Vec<usize>,
     /// Last sync timestamp in seconds.
@@ -307,6 +312,7 @@ impl WorkerCorpus {
         fuzzed_contracts: Option<&FuzzRunIdentifiedContracts>,
         max_time_delay: Option<u32>,
         max_block_delay: Option<u32>,
+        gen_weight: u32,
     ) -> Result<Self> {
         let mut mutation_types: Vec<BoxedStrategy<MutationType>> = vec![
             Just(MutationType::Splice).boxed(),
@@ -359,6 +365,7 @@ impl WorkerCorpus {
             config: config.into(),
             max_time_delay,
             max_block_delay,
+            gen_weight: gen_weight.min(100),
             new_entry_indices: Default::default(),
             last_sync_timestamp: worker_dir
                 .as_ref()
@@ -598,7 +605,9 @@ impl WorkerCorpus {
             return Ok(new_seq);
         };
 
-        if !self.in_memory_corpus.is_empty() {
+        if !self.in_memory_corpus.is_empty()
+            && !test_runner.rng().random_ratio(self.gen_weight, 100)
+        {
             let mutation_type = self
                 .mutation_generator
                 .new_tree(test_runner)
@@ -636,7 +645,9 @@ impl WorkerCorpus {
                     self.current_mutated = Some(corpus.uuid);
 
                     new_seq = corpus.tx_seq.clone();
-                    let repetitions = rng.random_range(1..32);
+                    // Cap repetitions so total sequence length stays under 32.
+                    let max_reps = 32usize.saturating_sub(new_seq.len()).max(1);
+                    let repetitions = rng.random_range(1..=max_reps);
                     let item_idx = rng.random_range(0..corpus.tx_seq.len());
                     let element = corpus.tx_seq[item_idx].clone();
                     for i in 0..repetitions {
@@ -773,7 +784,11 @@ impl WorkerCorpus {
 
                     let max = self.max_time_delay.unwrap_or(1) as u64;
                     let idx = rng.random_range(0..new_seq.len());
-                    new_seq[idx].warp = Some(U256::from(rng.random_range(0..=max)));
+                    // Shrink toward 0: pick random value in [0, current_delay] to bias toward
+                    // smaller delays rather than randomizing across the full range.
+                    let current =
+                        new_seq[idx].warp.unwrap_or(U256::ZERO).try_into().unwrap_or(max).min(max);
+                    new_seq[idx].warp = Some(U256::from(rng.random_range(0..=current)));
                 }
                 MutationType::Roll => {
                     trace!(target: "corpus", "roll mutate {}", primary.uuid);
@@ -783,7 +798,10 @@ impl WorkerCorpus {
 
                     let max = self.max_block_delay.unwrap_or(1) as u64;
                     let idx = rng.random_range(0..new_seq.len());
-                    new_seq[idx].roll = Some(U256::from(rng.random_range(0..=max)));
+                    // Shrink toward 0 (see Warp above).
+                    let current: u64 =
+                        new_seq[idx].roll.unwrap_or(U256::ZERO).try_into().unwrap_or(max).min(max);
+                    new_seq[idx].roll = Some(U256::from(rng.random_range(0..=current)));
                 }
             }
         }
@@ -854,8 +872,8 @@ impl WorkerCorpus {
         }
 
         // When running with coverage guided fuzzing enabled then generate new sequence if initial
-        // sequence's length is less than depth or randomly, to occasionally intermix new txs.
-        if depth > sequence.len().saturating_sub(1) || test_runner.rng().random_ratio(1, 10) {
+        // sequence's length is less than depth.
+        if depth > sequence.len().saturating_sub(1) {
             return self.new_tx(test_runner);
         }
 
@@ -1430,6 +1448,7 @@ mod tests {
             config: config.into(),
             max_time_delay: None,
             max_block_delay: None,
+            gen_weight: 80,
             in_memory_corpus: vec![],
             current_mutated: None,
             failed_replays: 0,

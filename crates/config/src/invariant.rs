@@ -41,7 +41,8 @@ pub struct InvariantConfig {
     pub max_time_delay: Option<u32>,
     /// Maximum number of blocks elapsed between generated txs.
     pub max_block_delay: Option<u32>,
-    /// Maximum amount (in wei) to deal to sender before each tx for payable functions.
+    /// Maximum amount (in ETH) to deal to sender before each tx for payable functions.
+    /// Converted to wei internally (value * 10^18).
     pub max_deal: Option<u64>,
     /// Number of calls to execute between invariant assertions.
     ///
@@ -55,7 +56,17 @@ pub struct InvariantConfig {
     /// invalid opcode assert behavior), even if `fail_on_revert` is `false`.
     pub fail_on_assert: bool,
     /// Continue invariant run until all invariants declared in current test suite breaks.
+    // TODO: runs=0 should imply continuous_run and run forever (until timeout/ctrl+C).
+    // This requires fixing runs_per_worker() to handle runs=0 without dividing by workers.
     pub continuous_run: bool,
+    /// Weight (0-100) controlling how often fresh sequences are generated vs corpus mutation.
+    ///
+    /// - `80` (default): 80% fresh generation, 20% corpus mutation
+    /// - `0`: Always mutate corpus (never generate fresh when corpus is non-empty)
+    /// - `100`: Always generate fresh sequences (no mutation)
+    ///
+    /// Override via `FOUNDRY_INVARIANT_GEN_WEIGHT` environment variable.
+    pub gen_weight: u32,
 }
 
 impl Default for InvariantConfig {
@@ -74,12 +85,13 @@ impl Default for InvariantConfig {
             show_metrics: true,
             timeout: None,
             show_solidity: false,
-            max_time_delay: None,
-            max_block_delay: None,
-            max_deal: None,
+            max_time_delay: Some(604_800),
+            max_block_delay: Some(60_480),
+            max_deal: Some(100),
             check_interval: 1,
             fail_on_assert: false,
             continuous_run: false,
+            gen_weight: 80,
         }
     }
 }

@@ -553,44 +553,45 @@ fn mutate_random_array_value(
 const MILLI_ETH: u64 = 1_000_000_000_000_000;
 /// 1 ETH in wei.
 const ONE_ETH: u64 = 1_000_000_000_000_000_000;
+/// 100 ETH in wei.
+const HUNDRED_ETH: u128 = 100_000_000_000_000_000_000;
 
 /// Returns a proptest strategy for generating random msg.value for payable functions.
-/// Biased towards smaller values to avoid balance issues.
 ///
 /// Distribution:
-/// - 85% chance: no value (None)
-/// - 10% chance: small values (0-1000 wei)
-/// - 4% chance: medium values (up to 0.001 ETH)
-/// - 1% chance: larger values (up to 1 ETH)
+/// - 40% chance: no value (None)
+/// - 25% chance: small values (0-1000 wei)
+/// - 20% chance: medium values (up to 0.001 ETH)
+/// - 10% chance: larger values (up to 1 ETH)
+/// - 5% chance: large values (up to 100 ETH)
 pub fn fuzz_msg_value() -> impl Strategy<Value = Option<U256>> {
     proptest::prop_oneof![
-        // 85% chance: no value
-        85 => proptest::strategy::Just(None),
-        // 10% chance: small values (0-1000 wei)
-        10 => (0u64..=1000).prop_map(|v| Some(U256::from(v))),
-        // 4% chance: medium values (up to 0.001 ETH)
-        4 => (0u64..=MILLI_ETH).prop_map(|v| Some(U256::from(v))),
-        // 1% chance: larger values (up to 1 ETH)
-        1 => (0u64..=ONE_ETH).prop_map(|v| Some(U256::from(v))),
+        40 => proptest::strategy::Just(None),
+        25 => (0u64..=1000).prop_map(|v| Some(U256::from(v))),
+        20 => (0u64..=MILLI_ETH).prop_map(|v| Some(U256::from(v))),
+        10 => (0u64..=ONE_ETH).prop_map(|v| Some(U256::from(v))),
+        5 => (0u128..=HUNDRED_ETH).prop_map(|v| Some(U256::from(v))),
     ]
 }
 
 /// Generates a random msg.value for payable functions using TestRunner's RNG.
-/// Biased towards smaller values to avoid balance issues.
 ///
 /// Distribution:
-/// - 60% chance: small values (0-1000 wei)
+/// - 40% chance: small values (0-1000 wei)
 /// - 30% chance: medium values (up to 0.001 ETH)
-/// - 9% chance: larger values (up to 1 ETH)
+/// - 20% chance: larger values (up to 1 ETH)
+/// - 9% chance: large values (up to 100 ETH)
 /// - 1% chance: max value (edge case)
 pub fn generate_msg_value(test_runner: &mut TestRunner) -> U256 {
-    match test_runner.rng().random_range(0..=10) {
-        // Small values (0-1000 wei) - 60% chance.
-        0..=5 => U256::from(test_runner.rng().random_range(0u64..=1000)),
+    match test_runner.rng().random_range(0..=99) {
+        // Small values (0-1000 wei) - 40% chance.
+        0..=39 => U256::from(test_runner.rng().random_range(0u64..=1000)),
         // Medium values (up to 0.001 ETH) - 30% chance.
-        6..=8 => U256::from(test_runner.rng().random_range(0u64..=MILLI_ETH)),
-        // Larger values (up to 1 ETH) - 9% chance.
-        9 => U256::from(test_runner.rng().random_range(0u64..=ONE_ETH)),
+        40..=69 => U256::from(test_runner.rng().random_range(0u64..=MILLI_ETH)),
+        // Larger values (up to 1 ETH) - 20% chance.
+        70..=89 => U256::from(test_runner.rng().random_range(0u64..=ONE_ETH)),
+        // Large values (up to 100 ETH) - 9% chance.
+        90..=98 => U256::from(test_runner.rng().random_range(0u128..=HUNDRED_ETH)),
         // Edge case (max) - 1% chance.
         _ => U256::MAX,
     }

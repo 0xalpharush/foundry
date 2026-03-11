@@ -434,6 +434,7 @@ impl FuzzedExecutor {
             None, // fuzzed_contracts for invariant tests
             None, // max_time_delay (not applicable for stateless fuzz)
             None, // max_block_delay (not applicable for stateless fuzz)
+            0,    // gen_weight (not applicable for stateless fuzz — always mutate)
         )?;
         let mut executor = self.executor_f.clone();
 

@@ -469,10 +469,12 @@ impl FuzzDictionary {
         }
         self.state_values.push(base);
         self.misses += 1;
-        let one = U256::from(1);
-        // TODO mutations take care of? also missing [-5, +5] boundaries
-        self.insert_value((value.wrapping_sub(one)).into());
-        self.insert_value((value.wrapping_add(one)).into());
+        // Seed +-3 boundary neighborhood for better edge-case coverage.
+        for delta in 1..=3u64 {
+            let d = U256::from(delta);
+            self.insert_value(value.wrapping_sub(d).into());
+            self.insert_value(value.wrapping_add(d).into());
+        }
         true
     }
 

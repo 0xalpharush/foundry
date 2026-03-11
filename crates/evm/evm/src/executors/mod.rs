@@ -1034,9 +1034,20 @@ impl RawCallResult {
     ///
     /// Scans the coverage map in u64 chunks to skip zero regions fast,
     /// and only collects `edges_hit` when new coverage is actually found.
+    ///
+    /// When `reverted` is true, coverage indices are offset by half the history_map size
+    /// so that a PC reached during a successful tx vs a reverting tx counts as separate coverage.
     pub fn merge_edge_coverage_detailed(
         &mut self,
         history_map: &mut [u8],
+    ) -> (bool, bool, Vec<usize>) {
+        self.merge_edge_coverage_detailed_with_revert(history_map, self.reverted)
+    }
+
+    fn merge_edge_coverage_detailed_with_revert(
+        &mut self,
+        history_map: &mut [u8],
+        reverted: bool,
     ) -> (bool, bool, Vec<usize>) {
         let mut new_coverage = false;
         let mut is_edge = false;
@@ -1044,6 +1055,10 @@ impl RawCallResult {
         let Some(coverage_map) = &self.edge_coverage else {
             return (false, false, Vec::new());
         };
+
+        // Offset for revert-differentiated coverage: success paths use the first half,
+        // revert paths use the second half of the history_map.
+        let revert_offset = if reverted { history_map.len() / 2 } else { 0 };
 
         // First pass: merge buckets into history_map, detect new coverage.
         // Scan in u64 chunks to skip zero regions quickly.
@@ -1069,14 +1084,18 @@ impl RawCallResult {
                         32..=127 => 64,
                         _ => 128,
                     };
-                    let prev_bucket = history_map[base + i];
+                    let hist_idx = revert_offset + base + i;
+                    if hist_idx >= history_map.len() {
+                        continue;
+                    }
+                    let prev_bucket = history_map[hist_idx];
                     if prev_bucket == 0 {
                         new_coverage = true;
                         is_edge = true;
-                        history_map[base + i] = bucket;
+                        history_map[hist_idx] = bucket;
                     } else if bucket > prev_bucket {
                         new_coverage = true;
-                        history_map[base + i] = bucket;
+                        history_map[hist_idx] = bucket;
                     }
                 }
             }
@@ -1096,14 +1115,18 @@ impl RawCallResult {
                     32..=127 => 64,
                     _ => 128,
                 };
-                let prev_bucket = history_map[idx];
+                let hist_idx = revert_offset + idx;
+                if hist_idx >= history_map.len() {
+                    continue;
+                }
+                let prev_bucket = history_map[hist_idx];
                 if prev_bucket == 0 {
                     new_coverage = true;
                     is_edge = true;
-                    history_map[idx] = bucket;
+                    history_map[hist_idx] = bucket;
                 } else if bucket > prev_bucket {
                     new_coverage = true;
-                    history_map[idx] = bucket;
+                    history_map[hist_idx] = bucket;
                 }
             }
         }
@@ -1113,7 +1136,14 @@ impl RawCallResult {
             coverage_map
                 .iter()
                 .enumerate()
-                .filter_map(|(idx, &h)| if h > 0 { Some(idx) } else { None })
+                .filter_map(|(idx, &h)| {
+                    if h > 0 {
+                        let hist_idx = revert_offset + idx;
+                        if hist_idx < history_map.len() { Some(hist_idx) } else { None }
+                    } else {
+                        None
+                    }
+                })
                 .collect()
         } else {
             Vec::new()
