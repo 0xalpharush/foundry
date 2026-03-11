@@ -1,4 +1,5 @@
 use crate::{invariant::RandomCallGenerator, strategies::EvmFuzzState};
+use alloy_primitives::B256;
 use foundry_common::mapping_slots::step as mapping_step;
 use foundry_evm_core::constants::CHEATCODE_ADDRESS;
 use revm::{
@@ -15,8 +16,25 @@ pub struct Fuzzer {
     pub collect: bool,
     /// Given a strategy, it generates a random call.
     pub call_generator: Option<RandomCallGenerator>,
-    /// If `collect` is set, we store the collected values in this fuzz dictionary.
+    /// Per-worker fuzz dictionary for strategy reads and batch flushes.
     pub fuzz_state: EvmFuzzState,
+    /// Per-worker buffer for stack values collected during EVM execution.
+    /// Flushed to `fuzz_state` between transactions to avoid per-opcode lock + hash overhead.
+    pending_values: Vec<B256>,
+    /// Cached fullness flag — once true, skip all further collection.
+    dict_full: bool,
+}
+
+impl Fuzzer {
+    pub fn new(fuzz_state: EvmFuzzState, call_generator: Option<RandomCallGenerator>) -> Self {
+        Self {
+            collect: true,
+            call_generator,
+            fuzz_state,
+            pending_values: Vec::with_capacity(256),
+            dict_full: false,
+        }
+    }
 }
 
 impl<CTX> Inspector<CTX> for Fuzzer
@@ -62,20 +80,23 @@ where
 }
 
 impl Fuzzer {
-    /// Collects `stack` and `memory` values into the fuzz dictionary.
+    /// Buffers stack values for later batch insertion into the fuzz dictionary.
+    /// Only a `Vec::extend` — no lock, no hashing.
     #[cold]
     fn collect_data(&mut self, interpreter: &Interpreter) {
-        self.fuzz_state.collect_values(interpreter.stack.data().iter().copied().map(Into::into));
-
-        // TODO: disabled for now since it's flooding the dictionary
-        // for index in 0..interpreter.shared_memory.len() / 32 {
-        //     let mut slot = [0u8; 32];
-        //     slot.clone_from_slice(interpreter.shared_memory.get_slice(index * 32, 32));
-
-        //     state.insert(slot);
-        // }
-
+        if !self.dict_full {
+            self.pending_values.extend(interpreter.stack.data().iter().copied().map(B256::from));
+        }
         self.collect = false;
+    }
+
+    /// Drain buffered values into the per-worker fuzz dictionary.
+    /// Called between transactions in the invariant worker loop.
+    pub fn flush_collected_values(&mut self) {
+        if self.pending_values.is_empty() || self.dict_full {
+            return;
+        }
+        self.dict_full = !self.fuzz_state.collect_values(self.pending_values.drain(..));
     }
 
     /// Overrides an external call to simulate reentrancy attacks.

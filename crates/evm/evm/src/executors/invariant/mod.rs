@@ -605,6 +605,12 @@ impl<'a> InvariantExecutor<'a> {
             }
         }
 
+        // Update the inspector's fuzz_state to the forked (per-worker) copy so that
+        // collect_values() in the inspector step() doesn't contend on the shared lock.
+        if let Some(fuzzer) = executor.inspector_mut().fuzzer.as_mut() {
+            fuzzer.fuzz_state = fuzz_state.clone();
+        }
+
         // Create own WorkerCorpus (only worker 0 replays corpus).
         let mut corpus_manager = WorkerCorpus::new(
             worker_id,
@@ -736,6 +742,10 @@ impl<'a> InvariantExecutor<'a> {
                 // Execute call from the randomly generated sequence without committing state.
                 // State is committed only if call is not a magic assume.
                 let mut call_result = execute_tx(&mut current_run.executor, tx)?;
+                // Flush inspector-buffered stack values to the per-worker dictionary.
+                if let Some(fuzzer) = current_run.executor.inspector_mut().fuzzer.as_mut() {
+                    fuzzer.flush_collected_values();
+                }
                 let discarded = call_result.result.as_ref() == MAGIC_ASSUME;
                 if self.config.show_metrics {
                     invariant_test.record_metrics(tx, call_result.reverted, discarded);
@@ -1165,11 +1175,7 @@ impl<'a> InvariantExecutor<'a> {
         // Set up fuzzer WITHOUT call_generator initially.
         // We defer call_override until after the initial invariant check to avoid
         // injecting random calls during setup which would break the invariant assertion.
-        self.executor.inspector_mut().set_fuzzer(Fuzzer {
-            call_generator: None,
-            fuzz_state: fuzz_state.clone(),
-            collect: true,
-        });
+        self.executor.inspector_mut().set_fuzzer(Fuzzer::new(fuzz_state.clone(), None));
 
         // Let's make sure the invariant is sound before actually starting the run:
         // We'll assert the invariant in its initial state, and if it fails, we'll

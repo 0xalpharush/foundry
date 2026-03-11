@@ -96,11 +96,19 @@ impl EvmFuzzState {
         self
     }
 
-    pub fn collect_values(&self, values: impl IntoIterator<Item = B256>) {
+    /// Inserts values into the fuzz dictionary.
+    /// Returns `true` if the dictionary still has capacity, `false` if full.
+    pub fn collect_values(&self, values: impl IntoIterator<Item = B256>) -> bool {
         let mut dict = self.inner.write();
-        for value in values {
-            dict.insert_value(value);
+        if dict.values_full() {
+            return false;
         }
+        for value in values {
+            if !dict.insert_value(value) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Collects state changes from a [StateChangeset] and logs into an [EvmFuzzState] according to
