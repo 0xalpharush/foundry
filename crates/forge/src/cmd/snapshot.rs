@@ -268,6 +268,7 @@ impl FromStr for GasSnapshotEntry {
                                         runs: runs.as_str().parse().unwrap(),
                                         calls: calls.as_str().parse().unwrap(),
                                         reverts: reverts.as_str().parse().unwrap(),
+                                        unique_failures: 0,
                                         metrics: HashMap::default(),
                                         failed_corpus_replays: 0,
                                         optimization_best_value: None,
@@ -626,6 +627,7 @@ mod tests {
                     reverts: 200,
                     metrics: HashMap::default(),
                     failed_corpus_replays: 0,
+                    unique_failures: 0,
                     optimization_best_value: None,
                 }
             }
@@ -647,6 +649,7 @@ mod tests {
                     reverts: 2388,
                     metrics: HashMap::default(),
                     failed_corpus_replays: 0,
+                    unique_failures: 0,
                     optimization_best_value: None,
                 }
             }

@@ -5,7 +5,6 @@ use crate::{
     },
     inspectors::Fuzzer,
 };
-use alloy_json_abi::Function;
 use alloy_primitives::{
     Address, Bytes, FixedBytes, I256, Selector, U256,
     map::{AddressMap, HashMap},
@@ -36,7 +35,7 @@ use foundry_evm_traces::{CallTraceArena, SparsedTraceArena};
 use indicatif::ProgressBar;
 use parking_lot::RwLock;
 use proptest::{strategy::Strategy, test_runner::TestRunner};
-use result::{assert_after_invariant, can_continue};
+use result::{assert_after_invariant, process_call_result};
 use revm::state::Account;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -47,7 +46,7 @@ use std::{
 };
 
 mod error;
-pub use error::{InvariantFailures, InvariantFuzzError};
+pub use error::{FailureKey, InvariantFailures, InvariantFuzzError};
 use foundry_evm_coverage::HitMaps;
 
 mod replay;
@@ -58,7 +57,7 @@ pub use result::InvariantFuzzTestResult;
 
 mod shrink;
 use crate::executors::invariant::result::invariant_preflight_check;
-pub use shrink::{check_sequence, check_sequence_value};
+pub use shrink::{FailureTarget, check_sequence, check_sequence_value};
 
 sol! {
     interface IInvariantTest {
@@ -189,14 +188,9 @@ impl InvariantTest {
         self.test_data.failures.reverts
     }
 
-    /// Whether invariant test has errors or not.
-    fn has_errors(&self, invariant: &Function) -> bool {
-        self.test_data.failures.has_failure(invariant)
-    }
-
     /// Set invariant test error.
-    fn set_error(&mut self, invariant: &Function, error: InvariantFuzzError) {
-        self.test_data.failures.record_failure(invariant, error);
+    fn set_error(&mut self, key: FailureKey, error: InvariantFuzzError) {
+        self.test_data.failures.record_failure(key, error);
     }
 
     /// Set last invariant run call sequence.
@@ -341,6 +335,7 @@ impl<'a> InvariantExecutor<'a> {
         fuzz_state: EvmFuzzState,
         progress: Option<&ProgressBar>,
         early_exit: &EarlyExit,
+        target_name: &str,
     ) -> Result<InvariantFuzzTestResult> {
         // Throw an error to abort test run if the invariant function accepts input params
         if !invariant_contract.invariant_fn.inputs.is_empty() {
@@ -354,6 +349,7 @@ impl<'a> InvariantExecutor<'a> {
         let mut runs = 0;
         let timer = FuzzTestTimer::new(self.config.timeout);
         let mut last_metrics_report = Instant::now();
+        let mut last_reported_failures = std::collections::HashSet::<FailureKey>::new();
         let continue_campaign = |runs: u32| {
             if early_exit.should_stop() {
                 return false;
@@ -386,12 +382,8 @@ impl<'a> InvariantExecutor<'a> {
             }
 
             while current_run.depth < self.config.depth {
-                // Check if the timeout has been reached.
-                if timer.is_timed_out() {
-                    // Since we never record a revert here the test is still considered
-                    // successful even though it timed out. We *want*
-                    // this behavior for now, so that's ok, but
-                    // future developers should be aware of this.
+                // Check if the timeout has been reached or if we should stop early (ctrl+C).
+                if timer.is_timed_out() || early_exit.should_stop() {
                     break 'stop;
                 }
 
@@ -420,7 +412,7 @@ impl<'a> InvariantExecutor<'a> {
                     current_run.rejects += 1;
                     if current_run.rejects > self.config.max_assume_rejects {
                         invariant_test.set_error(
-                            invariant_contract.invariant_fn,
+                            FailureKey::new(target_name, &invariant_contract.invariant_fn.name),
                             InvariantFuzzError::MaxAssumeRejects(self.config.max_assume_rejects),
                         );
                         break 'stop;
@@ -478,56 +470,90 @@ impl<'a> InvariantExecutor<'a> {
                             || is_last_call
                     };
 
-                    let can_continue = if should_check_invariant {
-                        can_continue(
+                    if should_check_invariant {
+                        process_call_result(
                             &invariant_contract,
                             &mut invariant_test,
                             &mut current_run,
                             &self.config,
                             call_result,
                             &state_changeset,
+                            target_name,
                         )
-                        .map_err(|e| eyre!(e.to_string()))?
+                        .map_err(|e| eyre!(e.to_string()))?;
                     } else {
-                        // Skip invariant check but still track reverts
+                        // Skip invariant check but still detect assertion failures
+                        if self.config.fail_on_assert
+                            && (call_result.is_assert_failure()
+                                || current_run.executor.has_global_failure(&state_changeset))
+                        {
+                            let handler_name = current_run
+                                .inputs
+                                .last()
+                                .and_then(|last_input| {
+                                    invariant_test
+                                        .targeted_contracts
+                                        .targets
+                                        .lock()
+                                        .fuzzed_metric_key(last_input)
+                                        .map(|metric_key| {
+                                            metric_key
+                                                .rsplit('.')
+                                                .next()
+                                                .unwrap_or(metric_key.as_str())
+                                                .to_string()
+                                        })
+                                })
+                                .unwrap_or_else(|| "unknown".to_string());
+                            let case_data = error::FailedInvariantCaseData::new(
+                                &invariant_contract,
+                                self.config.shrink_run_limit,
+                                self.config.fail_on_revert,
+                                self.config.fail_on_assert,
+                                &invariant_test.targeted_contracts,
+                                &current_run.inputs,
+                                &call_result,
+                                &[],
+                            );
+                            invariant_test.test_data.failures.revert_reason =
+                                Some(case_data.revert_reason.clone());
+                            invariant_test.test_data.failures.record_failure(
+                                FailureKey::new(target_name, &handler_name),
+                                InvariantFuzzError::BrokenAssertion(case_data),
+                            );
+                        }
+                        // Track reverts
                         if call_result.reverted {
                             invariant_test.test_data.failures.reverts += 1;
                             if self.config.fail_on_revert {
-                                for (invariant, fail_on_revert) in &invariant_contract.invariant_fns {
+                                for (invariant, fail_on_revert) in &invariant_contract.invariant_fns
+                                {
                                     if *fail_on_revert {
                                         let case_data = error::FailedInvariantCaseData::new(
                                             &invariant_contract,
                                             self.config.shrink_run_limit,
                                             *fail_on_revert,
+                                            self.config.fail_on_assert,
                                             &invariant_test.targeted_contracts,
                                             &current_run.inputs,
                                             &call_result,
                                             &[],
                                         );
-                                        invariant_test.test_data.failures
-                                            .errors
-                                            .insert(invariant.name.clone(), InvariantFuzzError::Revert(case_data));
+                                        invariant_test.test_data.failures.record_failure(
+                                            FailureKey::new(target_name, &invariant.name),
+                                            InvariantFuzzError::Revert(case_data),
+                                        );
                                     }
                                 }
-                                false
                             } else if !invariant_contract.is_optimization() {
                                 // In optimization mode, keep reverted calls to preserve
                                 // warp/roll values for correct replay during shrinking.
                                 current_run.inputs.pop();
-                                true
-                            } else {
-                                true
                             }
-                        } else {
-                            true
                         }
-                    };
-                    if !can_continue || current_run.depth == self.config.depth - 1 {
-                        invariant_test.set_last_run_inputs(&current_run.inputs);
                     }
-                    // If test cannot continue then stop current run and exit test suite.
-                    if !can_continue {
-                        break 'stop;
+                    if current_run.depth == self.config.depth - 1 {
+                        invariant_test.set_last_run_inputs(&current_run.inputs);
                     }
                     current_run.depth += 1;
                 }
@@ -543,15 +569,14 @@ impl<'a> InvariantExecutor<'a> {
             // Extend corpus with current run data.
             corpus_manager.process_inputs(&current_run.inputs, current_run.new_coverage);
 
-            // Call `afterInvariant` only if it is declared and test didn't fail already.
-            if invariant_contract.call_after_invariant
-                && !invariant_test.has_errors(invariant_contract.invariant_fn)
-            {
+            // Call `afterInvariant` if it is declared.
+            if invariant_contract.call_after_invariant {
                 assert_after_invariant(
                     &invariant_contract,
                     &mut invariant_test,
                     &current_run,
                     &self.config,
+                    target_name,
                 )
                 .map_err(|_| eyre!("Failed to call afterInvariant"))?;
             }
@@ -576,15 +601,38 @@ impl<'a> InvariantExecutor<'a> {
             } else if edge_coverage_enabled
                 && last_metrics_report.elapsed() > DURATION_BETWEEN_METRICS_REPORT
             {
-                // Display metrics inline if corpus dir set.
-                let metrics = json!({
+                let failures = &invariant_test.test_data.failures;
+
+                // Emit failure events for any new unique failures since last report.
+                for (key, error) in &failures.errors {
+                    if !last_reported_failures.contains(key) {
+                        let failure_event = json!({
+                            "timestamp": SystemTime::now()
+                                .duration_since(UNIX_EPOCH)?
+                                .as_secs(),
+                            "event": "failure",
+                            "target": key,
+                            "type": error.failure_type(),
+                        });
+                        let _ = sh_println!("{}", serde_json::to_string(&failure_event)?);
+                        last_reported_failures.insert(key.clone());
+                    }
+                }
+
+                // Emit pulse event with aggregate metrics.
+                let mut metrics = serde_json::to_value(&corpus_manager.metrics)?;
+                if let Some(obj) = metrics.as_object_mut() {
+                    obj.insert("unique_failures".into(), failures.unique_failures().into());
+                    obj.insert("failures".into(), failures.total_failures.into());
+                }
+                let pulse = json!({
                     "timestamp": SystemTime::now()
                         .duration_since(UNIX_EPOCH)?
                         .as_secs(),
-                    "invariant": invariant_contract.invariant_fn.name,
-                    "metrics": &corpus_manager.metrics,
+                    "event": "pulse",
+                    "metrics": metrics,
                 });
-                let _ = sh_println!("{}", serde_json::to_string(&metrics)?);
+                let _ = sh_println!("{}", serde_json::to_string(&pulse)?);
                 last_metrics_report = Instant::now();
             }
 
@@ -663,8 +711,10 @@ impl<'a> InvariantExecutor<'a> {
             &self.executor,
             &[],
             &mut failures,
+            "", // preflight check doesn't need target name
         )?;
-        if let Some(error) = failures.get_failure(invariant_contract.invariant_fn) {
+        if !failures.errors.is_empty() {
+            let error = failures.errors.values().next().unwrap();
             return Err(eyre!(error.revert_reason().unwrap_or_default()));
         }
 

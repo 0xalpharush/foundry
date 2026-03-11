@@ -49,6 +49,9 @@ pub struct InvariantConfig {
     ///
     /// Example: `check_interval = 10` means assert after calls 10, 20, 30, ... and the last call.
     pub check_interval: u32,
+    /// Fails the invariant fuzzing if a Solidity assert failure occurs (`Panic(0x01)` or legacy
+    /// invalid opcode assert behavior), even if `fail_on_revert` is `false`.
+    pub fail_on_assert: bool,
     /// Continue invariant run until all invariants declared in current test suite breaks.
     pub continuous_run: bool,
 }
@@ -72,6 +75,7 @@ impl Default for InvariantConfig {
             max_time_delay: None,
             max_block_delay: None,
             check_interval: 1,
+            fail_on_assert: false,
             continuous_run: false,
         }
     }

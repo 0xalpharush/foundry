@@ -1,7 +1,7 @@
 use super::{call_after_invariant_function, call_invariant_function, execute_tx};
 use crate::executors::{
     EarlyExit, Executor,
-    invariant::shrink::{shrink_sequence, shrink_sequence_value},
+    invariant::shrink::{FailureTarget, shrink_sequence, shrink_sequence_value},
 };
 use alloy_dyn_abi::JsonAbiExt;
 use alloy_primitives::{I256, Log, U256, map::HashMap};
@@ -29,6 +29,7 @@ pub fn replay_run(
     deprecated_cheatcodes: &mut HashMap<&'static str, Option<&'static str>>,
     inputs: &[BasicTxDetails],
     show_solidity: bool,
+    failing_fn_name: Option<&str>,
 ) -> Result<Vec<BaseCounterExample>> {
     // We want traces for a failed case.
     if executor.inspector().tracer.is_none() {
@@ -60,27 +61,49 @@ pub fn replay_run(
         ));
     }
 
-    // Replay invariant to collect logs and traces.
-    // We do this only once at the end of the replayed sequence.
-    // Checking after each call doesn't add valuable info for passing scenario
-    // (invariant call result is always success) nor for failed scenarios
-    // (invariant call result is always success until the last call that breaks it).
-    let (invariant_result, invariant_success) = call_invariant_function(
-        &executor,
-        invariant_contract.address,
-        invariant_contract.invariant_fn.abi_encode_input(&[])?.into(),
-    )?;
-    traces.push((TraceKind::Execution, invariant_result.traces.clone().unwrap()));
-    logs.extend(invariant_result.logs);
-    deprecated_cheatcodes.extend(
-        invariant_result
-            .cheatcodes
-            .as_ref()
-            .map_or_else(Default::default, |cheats| cheats.deprecated.clone()),
-    );
+    // Replay all invariant functions to collect logs and traces.
+    // Check each invariant function, same as the campaign run loop.
+    let mut all_invariants_pass = true;
+    for (invariant_fn, _fail_on_revert) in &invariant_contract.invariant_fns {
+        let (invariant_result, invariant_success) = call_invariant_function(
+            &executor,
+            invariant_contract.address,
+            invariant_fn.abi_encode_input(&[])?.into(),
+        )?;
+        traces.push((TraceKind::Execution, invariant_result.traces.clone().unwrap()));
+        logs.extend(invariant_result.logs);
+        deprecated_cheatcodes.extend(
+            invariant_result
+                .cheatcodes
+                .as_ref()
+                .map_or_else(Default::default, |cheats| cheats.deprecated.clone()),
+        );
+        if !invariant_success {
+            all_invariants_pass = false;
+            // Add the specific failing invariant function to the counterexample sequence.
+            if failing_fn_name == Some(invariant_fn.name.as_str()) {
+                let contract_name =
+                    ided_contracts.get(&invariant_contract.address).map(|(name, _)| name.clone());
+                counterexample_sequence.push(BaseCounterExample {
+                    warp: None,
+                    roll: None,
+                    sender: None,
+                    addr: Some(invariant_contract.address),
+                    calldata: invariant_fn.selector().to_vec().into(),
+                    contract_name,
+                    func_name: Some(invariant_fn.name.clone()),
+                    signature: Some(invariant_fn.signature()),
+                    args: Some(String::new()),
+                    raw_args: Some(String::new()),
+                    traces: None,
+                    show_solidity,
+                });
+            }
+        }
+    }
 
     // Collect after invariant logs and traces.
-    if invariant_contract.call_after_invariant && invariant_success {
+    if invariant_contract.call_after_invariant && all_invariants_pass {
         let (after_invariant_result, _) =
             call_after_invariant_function(&executor, invariant_contract.address)?;
         traces.push((TraceKind::Execution, after_invariant_result.traces.clone().unwrap()));
@@ -150,6 +173,7 @@ pub fn replay_error(
     deprecated_cheatcodes: &mut HashMap<&'static str, Option<&'static str>>,
     progress: Option<&ProgressBar>,
     early_exit: &EarlyExit,
+    failure_target: Option<&FailureTarget<'_>>,
 ) -> Result<Vec<BaseCounterExample>> {
     let calls = if let Some(target) = target_value {
         shrink_sequence_value(
@@ -162,12 +186,26 @@ pub fn replay_error(
             early_exit,
         )?
     } else {
-        shrink_sequence(&config, invariant_contract, calls, &executor, progress, early_exit)?
+        shrink_sequence(
+            &config,
+            invariant_contract,
+            calls,
+            &executor,
+            progress,
+            early_exit,
+            failure_target,
+        )?
     };
 
     if let Some(sequence) = inner_sequence {
         set_up_inner_replay(&mut executor, &sequence);
     }
+
+    // Derive the failing function name from the failure target.
+    let failing_fn_name = match failure_target {
+        Some(FailureTarget::Invariant(name)) => Some(*name),
+        _ => None,
+    };
 
     replay_run(
         invariant_contract,
@@ -180,6 +218,7 @@ pub fn replay_error(
         deprecated_cheatcodes,
         &calls,
         config.show_solidity,
+        failing_fn_name,
     )
 }
 
