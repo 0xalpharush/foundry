@@ -51,12 +51,20 @@ pub struct CowBackend<'a> {
     /// The [SpecId] to initialize the backend with on first mutable access.
     /// `None` means the backend has already been initialized for the current call.
     spec_id: Option<SpecId>,
+    /// Local overlay for cheatcode access accounts, avoiding CoW clone of the entire Backend
+    /// just to track which addresses can use cheatcodes.
+    cheatcode_access_accounts: std::collections::HashSet<Address>,
 }
 
 impl<'a> CowBackend<'a> {
     /// Creates a new `CowBackend` with the given `Backend`.
     pub fn new_borrowed(backend: &'a Backend) -> Self {
-        Self { backend: Cow::Borrowed(backend), spec_id: Some(SpecId::default()) }
+        let cheatcode_access_accounts = backend.inner.cheatcode_access_accounts.clone();
+        Self {
+            backend: Cow::Borrowed(backend),
+            spec_id: Some(SpecId::default()),
+            cheatcode_access_accounts,
+        }
     }
 
     /// Executes the configured transaction of the `env` without committing state changes
@@ -289,15 +297,15 @@ impl DatabaseExt for CowBackend<'_> {
     }
 
     fn allow_cheatcode_access(&mut self, account: Address) -> bool {
-        self.backend.to_mut().allow_cheatcode_access(account)
+        self.cheatcode_access_accounts.insert(account)
     }
 
     fn revoke_cheatcode_access(&mut self, account: &Address) -> bool {
-        self.backend.to_mut().revoke_cheatcode_access(account)
+        self.cheatcode_access_accounts.remove(account)
     }
 
     fn has_cheatcode_access(&self, account: &Address) -> bool {
-        self.backend.has_cheatcode_access(account)
+        self.cheatcode_access_accounts.contains(account)
     }
 
     fn set_blockhash(&mut self, block_number: U256, block_hash: B256) {

@@ -128,9 +128,12 @@ pub fn fuzz_param_from_state(
         // entire dictionary.
         any::<(bool, prop::sample::Index)>().prop_map(move |(bias, index)| {
             let state = state.dictionary_read();
-            let values = if bias { state.samples(&param) } else { None }
-                .unwrap_or_else(|| state.values())
-                .as_slice();
+            if bias {
+                if let Some(samples) = state.samples(&param) {
+                    return samples[index.index(samples.len())];
+                }
+            }
+            let values = state.values();
             values[index.index(values.len())]
         })
     };

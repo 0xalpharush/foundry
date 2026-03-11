@@ -215,7 +215,7 @@ pub(crate) struct CorpusMetrics {
     // Number of corpus entries.
     corpus_count: usize,
     // Number of corpus entries that are favored.
-    favored_items: usize, // TODO remove or add to metrics as in-mem corpus count 
+    favored_items: usize, // TODO remove or add to metrics as in-mem corpus count
 }
 
 impl fmt::Display for CorpusMetrics {
@@ -498,57 +498,50 @@ impl WorkerCorpus {
         }
     }
 
-    /// Recomputes which corpus entries are favored.
-    /// Uses greedy set cover: prioritize rare edges, pick the smallest
-    /// corpus that covers each, mark it favored, repeat.
+    /// Recomputes which corpus entries are favored using greedy set cover.
+    /// Prioritizes rare edges (covered by fewer corpus entries) first,
+    /// then picks the cheapest (top_rated) corpus for each uncovered edge.
     fn recompute_favored_and_cull_corpus(&mut self) -> Result<()> {
         if self.in_memory_corpus.is_empty() {
             return Ok(());
         }
 
-        // Step 1: Reset all favored flags
+        // Build a uuid→index map for O(1) corpus lookup.
+        let uuid_to_idx: std::collections::HashMap<Uuid, usize> =
+            self.in_memory_corpus.iter().enumerate().map(|(i, c)| (c.uuid, i)).collect();
+
+        // Reset all favored flags.
         for corpus in &mut self.in_memory_corpus {
             corpus.is_favored = false;
         }
 
-        // Step 2: Build list of (edge_index, rarity) for edges we've seen
-        // Rarity = how many corpus entries cover this edge
-        let mut edge_rarity: Vec<(usize, usize)> = Vec::new();
-
-        for edge_idx in 0..COVERAGE_MAP_SIZE {
-            // Only consider edges that have a top_rated entry
-            if self.top_rated[edge_idx].is_some() {
-                let count = self
-                    .in_memory_corpus
-                    .iter()
-                    .filter(|c| c.unique_edges_covered.contains(&edge_idx))
-                    .count();
-
-                if count > 0 {
-                    edge_rarity.push((edge_idx, count));
-                }
+        // Compute edge rarity: count how many corpus entries cover each edge.
+        // Uses a flat array instead of per-edge linear scans.
+        let mut edge_cover_count = vec![0u32; COVERAGE_MAP_SIZE];
+        for corpus in &self.in_memory_corpus {
+            for &edge_idx in &corpus.unique_edges_covered {
+                edge_cover_count[edge_idx] += 1;
             }
         }
 
-        // Step 3: Sort by rarity (rarest edges first)
-        edge_rarity.sort_by_key(|&(_, count)| count);
+        // Collect edges that have a top_rated entry, sorted by rarity (rarest first).
+        let mut edges_by_rarity: Vec<(usize, u32)> = (0..COVERAGE_MAP_SIZE)
+            .filter(|&i| self.top_rated[i].is_some() && edge_cover_count[i] > 0)
+            .map(|i| (i, edge_cover_count[i]))
+            .collect();
+        edges_by_rarity.sort_unstable_by_key(|&(_, count)| count);
 
-        // Step 4: Track which edges we've covered
+        // Greedy selection: pick the top_rated corpus for each uncovered edge.
         let mut covered = vec![false; COVERAGE_MAP_SIZE];
-
-        // Step 5: Greedy selection
-        for (edge_idx, _) in edge_rarity {
+        for (edge_idx, _) in edges_by_rarity {
             if covered[edge_idx] {
-                continue; // Already covered by a favored corpus
+                continue;
             }
 
-            // Get the top_rated corpus for this edge
             if let Some((uuid, _)) = self.top_rated[edge_idx] {
-                if let Some(corpus) = self.in_memory_corpus.iter_mut().find(|c| c.uuid == uuid) {
-                    // Mark this corpus as favored
+                if let Some(&corpus_idx) = uuid_to_idx.get(&uuid) {
+                    let corpus = &mut self.in_memory_corpus[corpus_idx];
                     corpus.is_favored = true;
-
-                    // Mark all edges this corpus covers as covered
                     for &e in &corpus.unique_edges_covered {
                         covered[e] = true;
                     }
@@ -556,7 +549,7 @@ impl WorkerCorpus {
             }
         }
 
-        // Step 6: Update metrics
+        // Update metrics.
         self.metrics.favored_items = self.in_memory_corpus.iter().filter(|c| c.is_favored).count();
 
         self.cull_corpus()

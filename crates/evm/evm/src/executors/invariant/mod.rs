@@ -573,7 +573,7 @@ impl<'a> InvariantExecutor<'a> {
             targets: Arc::new(Mutex::new(targeted_contracts.targets.lock().clone())),
             is_updatable: targeted_contracts.is_updatable,
         };
-        let fuzz_state = fuzz_state.fork();
+        let fuzz_state = fuzz_state.fork(self.num_workers);
 
         // Each worker creates its own strategy (BoxedStrategy is not Send/Sync due to Rc).
         let strategy = invariant_strat(

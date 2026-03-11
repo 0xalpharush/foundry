@@ -5,7 +5,7 @@ use alloy_dyn_abi::{DynSolType, DynSolValue, EventExt, FunctionExt};
 use alloy_json_abi::{Function, JsonAbi};
 use alloy_primitives::{
     Address, B256, Bytes, Log, U256,
-    map::{AddressIndexSet, AddressMap, B256IndexSet, HashMap, IndexSet},
+    map::{AddressIndexSet, AddressMap, B256IndexSet, B256Set, HashMap, IndexSet},
 };
 use foundry_common::{
     ignore_metadata_hash, mapping_slots::MappingSlots, slot_identifier::SlotIdentifier,
@@ -77,9 +77,15 @@ impl EvmFuzzState {
     }
 
     /// Creates an isolated copy with its own `RwLock<FuzzDictionary>`.
-    pub fn fork(&self) -> Self {
+    /// Caps the dictionary size to limit per-worker insertion overhead.
+    pub fn fork(&self, num_workers: usize) -> Self {
+        let mut dict = self.inner.read().clone();
+        // Divide the user-configured limits among workers.
+        let n = num_workers.max(1);
+        dict.config.max_fuzz_dictionary_values /= n;
+        dict.config.max_fuzz_dictionary_addresses /= n;
         Self {
-            inner: Arc::new(RwLock::new(self.inner.read().clone())),
+            inner: Arc::new(RwLock::new(dict)),
             deployed_libs: self.deployed_libs.clone(),
             mapping_slots: self.mapping_slots.clone(),
         }
@@ -152,8 +158,10 @@ impl EvmFuzzState {
 // for performance when iterating over the sets.
 #[derive(Clone)]
 pub struct FuzzDictionary {
-    /// Collected state values.
-    state_values: B256IndexSet,
+    /// Collected state values (ordered for index-based random access).
+    state_values: Vec<B256>,
+    /// Dedup set for O(1) membership checks on state_values.
+    state_values_set: B256Set,
     /// Addresses that already had their PUSH bytes collected.
     addresses: AddressIndexSet,
     /// Configuration for the dictionary.
@@ -201,6 +209,7 @@ impl FuzzDictionary {
             samples_seeded: false,
 
             state_values: Default::default(),
+            state_values_set: Default::default(),
             addresses: Default::default(),
             db_state_values: Default::default(),
             db_addresses: Default::default(),
@@ -322,6 +331,11 @@ impl FuzzDictionary {
         storage_layouts: &HashMap<Address, Arc<StorageLayout>>,
         mapping_slots: Option<&AddressMap<MappingSlots>>,
     ) {
+        // Skip entirely if dictionary is full — no new values can be inserted and push bytes
+        // are only collected once per address (already-seen addresses are skipped).
+        if self.values_full() {
+            return;
+        }
         for (address, account) in state_changeset {
             // Insert basic account information.
             self.insert_value(address.into_word());
@@ -422,21 +436,36 @@ impl FuzzDictionary {
     ///
     /// Returns true if the value was inserted.
     fn insert_value(&mut self, value: B256) -> bool {
-        let insert = !self.values_full();
-        if insert {
-            let new_value = self.state_values.insert(value);
-            let counter = if new_value { &mut self.misses } else { &mut self.hits };
-            *counter += 1;
+        if self.values_full() {
+            return false;
         }
-        insert
+        if self.state_values_set.insert(value) {
+            self.state_values.push(value);
+            self.misses += 1;
+        } else {
+            self.hits += 1;
+        }
+        true
     }
 
     fn insert_value_u256(&mut self, value: U256) -> bool {
-        // Also add the value below and above the push value to the dictionary.
+        if self.values_full() {
+            return false;
+        }
+        // Insert the value and its ±1 boundary variants.
+        // Skip ±1 if the base value was already known (boundaries likely are too).
+        let base = B256::from(value);
+        if !self.state_values_set.insert(base) {
+            self.hits += 1;
+            return true;
+        }
+        self.state_values.push(base);
+        self.misses += 1;
         let one = U256::from(1);
-        self.insert_value(value.into())
-            | self.insert_value((value.wrapping_sub(one)).into())
-            | self.insert_value((value.wrapping_add(one)).into())
+        // TODO mutations take care of? also missing [-5, +5] boundaries
+        self.insert_value((value.wrapping_sub(one)).into());
+        self.insert_value((value.wrapping_add(one)).into());
+        true
     }
 
     fn values_full(&self) -> bool {
@@ -470,7 +499,7 @@ impl FuzzDictionary {
         }
     }
 
-    pub fn values(&self) -> &B256IndexSet {
+    pub fn values(&self) -> &[B256] {
         &self.state_values
     }
 
@@ -515,7 +544,9 @@ impl FuzzDictionary {
 
     /// Revert values and addresses collected during the run by truncating to initial db len.
     pub fn revert(&mut self) {
-        self.state_values.truncate(self.db_state_values);
+        for value in self.state_values.drain(self.db_state_values..) {
+            self.state_values_set.remove(&value);
+        }
         self.addresses.truncate(self.db_addresses);
     }
 
