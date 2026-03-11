@@ -171,6 +171,8 @@ struct InvariantTest {
     fuzz_state: EvmFuzzState,
     // Contracts fuzzed by the invariant test.
     targeted_contracts: FuzzRunIdentifiedContracts,
+    // Sender filters (targeted/excluded senders).
+    sender_filters: SenderFilters,
     // Data collected during invariant runs.
     test_data: InvariantTestData,
 }
@@ -180,6 +182,7 @@ impl InvariantTest {
     fn new(
         fuzz_state: EvmFuzzState,
         targeted_contracts: FuzzRunIdentifiedContracts,
+        sender_filters: SenderFilters,
         failures: InvariantFailures,
         branch_runner: TestRunner,
     ) -> Self {
@@ -194,7 +197,7 @@ impl InvariantTest {
             optimization_best_value: None,
             optimization_best_sequence: vec![],
         };
-        Self { fuzz_state, targeted_contracts, test_data }
+        Self { fuzz_state, targeted_contracts, sender_filters, test_data }
     }
 
     /// Returns number of invariant test reverts.
@@ -621,6 +624,8 @@ impl<'a> InvariantExecutor<'a> {
             if worker_id == 0 { Some(&executor) } else { None },
             None,
             Some(&targeted_contracts),
+            self.config.max_time_delay,
+            self.config.max_block_delay,
         )?;
 
         // Create own TestRunner. Worker 0 clones the runner as-is for determinism;
@@ -637,6 +642,7 @@ impl<'a> InvariantExecutor<'a> {
         let mut invariant_test = InvariantTest::new(
             fuzz_state.clone(),
             targeted_contracts.clone(),
+            targeted_senders.clone(),
             initial_failures.clone(),
             branch_runner,
         );
@@ -716,6 +722,7 @@ impl<'a> InvariantExecutor<'a> {
                 &mut invariant_test.test_data.branch_runner,
                 &invariant_test.fuzz_state,
                 &invariant_test.targeted_contracts,
+                Some(&invariant_test.sender_filters),
             )?;
 
             // Create current invariant run data.
@@ -1587,7 +1594,8 @@ pub(crate) fn call_invariant_function(
 }
 
 /// Executes a fuzz call and returns the result.
-/// Applies any block timestamp (warp) and block number (roll) adjustments before the call.
+/// Applies any block timestamp (warp), block number (roll), and balance (deal) adjustments before
+/// the call.
 pub(crate) fn execute_tx(executor: &mut Executor, tx: &BasicTxDetails) -> Result<RawCallResult> {
     let warp = tx.warp.unwrap_or_default();
     let roll = tx.roll.unwrap_or_default();
@@ -1611,7 +1619,24 @@ pub(crate) fn execute_tx(executor: &mut Executor, tx: &BasicTxDetails) -> Result
         }
     }
 
+    let requested_value = tx.call_details.value.unwrap_or(U256::ZERO);
+
+    // If no value requested, skip balance checks and deal logic.
+    let value = if requested_value.is_zero() {
+        U256::ZERO
+    } else {
+        // Apply deal (increase sender balance) if specified.
+        if let Some(deal) = tx.deal {
+            let current_balance = executor.get_balance(tx.sender)?;
+            executor.set_balance(tx.sender, current_balance + deal)?;
+        }
+
+        // Only use value if sender has sufficient balance (after deal), otherwise fall back to 0.
+        let sender_balance = executor.get_balance(tx.sender)?;
+        if sender_balance >= requested_value { requested_value } else { U256::ZERO }
+    };
+
     executor
-        .call_raw(tx.sender, tx.call_details.target, tx.call_details.calldata.clone(), U256::ZERO)
+        .call_raw(tx.sender, tx.call_details.target, tx.call_details.calldata.clone(), value)
         .map_err(|e| eyre!(format!("Could not make raw evm call: {e}")))
 }

@@ -108,7 +108,7 @@ pub struct FuzzCorpusConfig {
     pub corpus_gzip: bool,
     // Number of mutations until entry marked as eligible to be flushed from in-memory corpus.
     // Mutations will be performed at least `corpus_min_mutations` times.
-    pub corpus_min_mutations: usize,
+    pub corpus_min_mutations: usize, // TODO remove
     // Number of corpus that won't be evicted from memory.
     pub corpus_min_size: usize,
     /// Whether to collect and display edge coverage metrics.

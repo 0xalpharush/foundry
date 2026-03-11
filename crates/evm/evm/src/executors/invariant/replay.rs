@@ -87,9 +87,11 @@ pub fn replay_run(
                 counterexample_sequence.push(BaseCounterExample {
                     warp: None,
                     roll: None,
+                    deal: None,
                     sender: None,
                     addr: Some(invariant_contract.address),
                     calldata: invariant_fn.selector().to_vec().into(),
+                    value: None,
                     contract_name,
                     func_name: Some(invariant_fn.name.clone()),
                     signature: Some(invariant_fn.signature()),

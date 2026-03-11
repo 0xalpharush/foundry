@@ -250,8 +250,13 @@ impl FuzzedExecutor {
             &[BasicTxDetails {
                 warp: None,
                 roll: None,
+                deal: None,
                 sender: self.sender,
-                call_details: CallDetails { target: address, calldata: calldata.clone() },
+                call_details: CallDetails {
+                    target: address,
+                    calldata: calldata.clone(),
+                    value: None,
+                },
             }],
             new_coverage,
             edges,
@@ -414,8 +419,9 @@ impl FuzzedExecutor {
         .prop_map(move |calldata| BasicTxDetails {
             warp: None,
             roll: None,
+            deal: None,
             sender: Default::default(),
-            call_details: CallDetails { target: Default::default(), calldata },
+            call_details: CallDetails { target: Default::default(), calldata, value: None },
         });
 
         let mut corpus = WorkerCorpus::new(
@@ -426,6 +432,8 @@ impl FuzzedExecutor {
             if worker_id == 0 { Some(&self.executor_f) } else { None },
             Some(func),
             None, // fuzzed_contracts for invariant tests
+            None, // max_time_delay (not applicable for stateless fuzz)
+            None, // max_block_delay (not applicable for stateless fuzz)
         )?;
         let mut executor = self.executor_f.clone();
 
