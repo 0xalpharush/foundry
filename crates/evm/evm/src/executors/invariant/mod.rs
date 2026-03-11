@@ -587,6 +587,8 @@ impl<'a> InvariantExecutor<'a> {
             let handler_addresses: std::collections::HashSet<Address> =
                 targeted_contracts.targets.lock().keys().copied().collect();
 
+            // TODO: each worker should have a unique RNG so they don't generate identical
+            // call sequences. Currently all workers clone self.runner with the same seed.
             let call_generator = RandomCallGenerator::new(
                 invariant_contract.address,
                 handler_addresses,
@@ -656,6 +658,9 @@ impl<'a> InvariantExecutor<'a> {
         let mut last_reported_failures = std::collections::HashSet::<FailureKey>::new();
         let mut last_metrics_calls: u64 = 0;
         let mut last_metrics_gas: u64 = 0;
+        let (init_global_calls, init_global_gas, _) = shared_state.global_totals();
+        let mut last_global_calls: u64 = init_global_calls;
+        let mut last_global_gas: u64 = init_global_gas;
 
         'stop: while shared_state.should_continue() && worker.runs < worker_runs {
             if last_sync.elapsed() >= SYNC_INTERVAL {
@@ -832,6 +837,7 @@ impl<'a> InvariantExecutor<'a> {
                                     "type": error.failure_type(),
                                 });
                                 let _ = sh_println!("{}", serde_json::to_string(&failure_event)?);
+                                // TODO: persist failure immediately so it survives Ctrl+C.
                                 last_reported_failures.insert(key.clone());
                             }
                         }
@@ -845,10 +851,8 @@ impl<'a> InvariantExecutor<'a> {
                         let local_failures = counters.failures.load(Ordering::Relaxed);
                         let delta_calls = local_calls - last_metrics_calls;
                         let delta_gas = local_gas - last_metrics_gas;
-                        let tx_per_sec =
-                            if elapsed > 0.0 { delta_calls as f64 / elapsed } else { 0.0 };
-                        let gas_per_sec =
-                            if elapsed > 0.0 { delta_gas as f64 / elapsed } else { 0.0 };
+                        let tx_per_sec = delta_calls as f64 / elapsed;
+                        let gas_per_sec = delta_gas as f64 / elapsed;
                         let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                         let pulse = json!({
                             "worker_id": worker_id,
@@ -872,17 +876,21 @@ impl<'a> InvariantExecutor<'a> {
                             corpus_manager.sync_metrics(&shared_state.global_corpus_metrics);
                             let (global_calls, global_gas, global_failures) =
                                 shared_state.global_totals();
+                            let global_delta_calls = global_calls - last_global_calls;
+                            let global_delta_gas = global_gas - last_global_gas;
                             let global_event = json!({
                                 "timestamp": ts,
                                 "event": "global_metrics",
                                 "target": target_name,
                                 "metrics": {
                                     "failures": global_failures,
-                                    "tx/s": (global_calls as f64 / elapsed) as u64,
-                                    "gas/s": (global_gas as f64 / elapsed) as u64,
+                                    "tx/s": if elapsed > 0.0 { (global_delta_calls as f64 / elapsed) as u64 } else { 0 },
+                                    "gas/s": if elapsed > 0.0 { (global_delta_gas as f64 / elapsed) as u64 } else { 0 },
                                 },
                             });
                             let _ = sh_println!("{}", serde_json::to_string(&global_event)?);
+                            last_global_calls = global_calls;
+                            last_global_gas = global_gas;
                         }
                         last_metrics_report = Instant::now();
                     }
@@ -1039,14 +1047,12 @@ impl<'a> InvariantExecutor<'a> {
                     }
                     // Add throughput metrics.
                     let elapsed = last_metrics_report.elapsed().as_secs_f64();
-                    if elapsed > 0.0 {
-                        let (global_calls, global_gas, _) = shared_state.global_totals();
-                        let delta_calls = global_calls - last_metrics_calls;
-                        let delta_gas = global_gas - last_metrics_gas;
-                        let tx_s = delta_calls as f64 / elapsed;
-                        let gas_s = delta_gas as f64 / elapsed;
-                        parts.push(format!("\n      {tx_s:.0} tx/s, {gas_s:.0} gas/s"));
-                    }
+                    let (global_calls, global_gas, _) = shared_state.global_totals();
+                    let delta_calls = global_calls - last_global_calls;
+                    let delta_gas = global_gas - last_global_gas;
+                    let tx_s = delta_calls as f64 / elapsed;
+                    let gas_s = delta_gas as f64 / elapsed;
+                    parts.push(format!("\n      {tx_s:.0} tx/s, {gas_s:.0} gas/s"));
                     progress.set_message(parts.join(""));
                 }
             }
