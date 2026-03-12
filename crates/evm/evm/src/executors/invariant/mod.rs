@@ -2,7 +2,7 @@ use crate::{
     executors::{
         DURATION_BETWEEN_METRICS_REPORT, EarlyExit, EvmError, Executor, FuzzTestTimer,
         RawCallResult,
-        corpus::{GlobalCorpusMetrics, SyncStats, WorkerCorpus},
+        corpus::{SyncStats, WorkerCorpus},
     },
     inspectors::Fuzzer,
 };
@@ -46,6 +46,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     collections::{HashMap as Map, btree_map::Entry},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU32, AtomicU64, Ordering},
@@ -305,11 +306,19 @@ struct WorkerCounters {
     calls: AtomicU64,
     gas: AtomicU64,
     failures: AtomicU64,
+    corpus_count: AtomicU64,
+    edge_count: AtomicU64,
 }
 
 impl WorkerCounters {
     fn new() -> Self {
-        Self { calls: AtomicU64::new(0), gas: AtomicU64::new(0), failures: AtomicU64::new(0) }
+        Self {
+            calls: AtomicU64::new(0),
+            gas: AtomicU64::new(0),
+            failures: AtomicU64::new(0),
+            corpus_count: AtomicU64::new(0),
+            edge_count: AtomicU64::new(0),
+        }
     }
 
     fn add_call(&self, gas: u64) {
@@ -332,8 +341,6 @@ struct SharedInvariantState {
     early_exit: EarlyExit,
     /// Local early exit (failure triggered).
     local_early_exit: EarlyExit,
-    /// Global corpus metrics.
-    global_corpus_metrics: GlobalCorpusMetrics,
 }
 
 impl SharedInvariantState {
@@ -345,7 +352,6 @@ impl SharedInvariantState {
             timer: FuzzTestTimer::new(timeout),
             early_exit,
             local_early_exit: EarlyExit::new(true),
-            global_corpus_metrics: GlobalCorpusMetrics::default(),
         }
     }
 
@@ -364,6 +370,16 @@ impl SharedInvariantState {
             failures += wc.failures.load(Ordering::Relaxed);
         }
         (calls, gas, failures)
+    }
+
+    /// Sum corpus count across all workers.
+    fn global_corpus_count(&self) -> u64 {
+        self.worker_counters.iter().map(|wc| wc.corpus_count.load(Ordering::Relaxed)).sum()
+    }
+
+    /// Sum edge count across all workers.
+    fn global_edge_count(&self) -> u64 {
+        self.worker_counters.iter().map(|wc| wc.edge_count.load(Ordering::Relaxed)).sum()
     }
 
     /// Returns `true` if the worker should continue running.
@@ -493,6 +509,7 @@ impl<'a> InvariantExecutor<'a> {
         early_exit: &EarlyExit,
         target_name: &str,
         tokio_handle: &tokio::runtime::Handle,
+        failure_dir: Option<PathBuf>,
     ) -> Result<InvariantFuzzTestResult> {
         // Throw an error to abort test run if the invariant function accepts input params
         if !invariant_contract.invariant_fn.inputs.is_empty() {
@@ -535,6 +552,7 @@ impl<'a> InvariantExecutor<'a> {
                     &shared_state,
                     progress,
                     target_name,
+                    failure_dir.as_deref(),
                 );
                 debug!(worker_id, elapsed = ?timer.elapsed(), "invariant worker finished");
                 r
@@ -559,6 +577,7 @@ impl<'a> InvariantExecutor<'a> {
         shared_state: &SharedInvariantState,
         progress: Option<&ProgressBar>,
         target_name: &str,
+        failure_dir: Option<&std::path::Path>,
     ) -> Result<InvariantWorkerState> {
         let mut worker = InvariantWorkerState::new(worker_id);
         let counters = &shared_state.worker_counters[worker_id];
@@ -677,14 +696,12 @@ impl<'a> InvariantExecutor<'a> {
                         &executor,
                         None,
                         Some(&targeted_contracts),
-                        &shared_state.global_corpus_metrics,
                     )?;
                 let total_elapsed = timer.elapsed();
                 last_sync = Instant::now();
 
                 // Emit separate import/export events in JSON log from all workers.
                 if edge_coverage_enabled {
-                    corpus_manager.sync_metrics(&shared_state.global_corpus_metrics);
                     let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                     if imported > 0 {
                         let event = json!({
@@ -844,7 +861,14 @@ impl<'a> InvariantExecutor<'a> {
                                     "type": error.failure_type(),
                                 });
                                 let _ = sh_println!("{}", serde_json::to_string(&failure_event)?);
-                                // TODO: persist failure immediately so it survives Ctrl+C.
+                                // Persist failure immediately so it survives Ctrl+C.
+                                if let Some(dir) = failure_dir {
+                                    let fn_name = key.function_name();
+                                    let _ = foundry_common::fs::create_dir_all(dir);
+                                    // Write a marker file so the failure watcher detects it.
+                                    let failure_file = dir.join(fn_name);
+                                    let _ = std::fs::write(&failure_file, b"");
+                                }
                                 last_reported_failures.insert(key.clone());
                             }
                         }
@@ -861,6 +885,10 @@ impl<'a> InvariantExecutor<'a> {
                         let tx_per_sec = delta_calls as f64 / elapsed;
                         let gas_per_sec = delta_gas as f64 / elapsed;
                         let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+                        let local_corpus = corpus_manager.corpus_count() as u64;
+                        let local_edges = corpus_manager.metrics.edge_count as u64;
+                        counters.corpus_count.store(local_corpus, Ordering::Relaxed);
+                        counters.edge_count.store(local_edges, Ordering::Relaxed);
                         let pulse = json!({
                             "worker_id": worker_id,
                             "timestamp": ts,
@@ -869,9 +897,10 @@ impl<'a> InvariantExecutor<'a> {
                             "metrics": {
                                 "unique_failures": failures.unique_failures(),
                                 "failures": local_failures,
-                                "corpus_count": corpus_manager.corpus_count(),
+                                "corpus_count": local_corpus,
                                 "tx/s": tx_per_sec as u64,
                                 "gas/s": gas_per_sec as u64,
+                                "edge_count": corpus_manager.metrics.edge_count,
                             },
                         });
                         let _ = sh_println!("{}", serde_json::to_string(&pulse)?);
@@ -880,7 +909,6 @@ impl<'a> InvariantExecutor<'a> {
 
                         // Worker 0 also emits global_metrics aggregated across all workers.
                         if worker_id == 0 {
-                            corpus_manager.sync_metrics(&shared_state.global_corpus_metrics);
                             let (global_calls, global_gas, global_failures) =
                                 shared_state.global_totals();
                             let global_delta_calls = global_calls - last_global_calls;
@@ -893,6 +921,8 @@ impl<'a> InvariantExecutor<'a> {
                                     "failures": global_failures,
                                     "tx/s": if elapsed > 0.0 { (global_delta_calls as f64 / elapsed) as u64 } else { 0 },
                                     "gas/s": if elapsed > 0.0 { (global_delta_gas as f64 / elapsed) as u64 } else { 0 },
+                                    "edge_count": shared_state.global_edge_count(),
+                                    "corpus_count": shared_state.global_corpus_count(),
                                 },
                             });
                             let _ = sh_println!("{}", serde_json::to_string(&global_event)?);
@@ -1049,8 +1079,11 @@ impl<'a> InvariantExecutor<'a> {
                     }
                     // Add edge coverage metrics if enabled
                     if edge_coverage_enabled {
-                        corpus_manager.sync_metrics(&shared_state.global_corpus_metrics);
-                        parts.push(format!("{}", shared_state.global_corpus_metrics));
+                        parts.push(format!(
+                            "\n        - edge count: {}\n        - corpus count: {}",
+                            shared_state.global_edge_count(),
+                            shared_state.global_corpus_count(),
+                        ));
                     }
                     // Add throughput metrics.
                     let elapsed = last_metrics_report.elapsed().as_secs_f64();

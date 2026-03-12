@@ -984,6 +984,7 @@ impl<'a> FunctionRunner<'a> {
             &self.tcfg.early_exit,
             target_name,
             self.cr.tokio_handle,
+            Some(failure_dir.clone()),
         ) {
             Ok(x) => x,
             Err(e) => {

@@ -54,10 +54,7 @@ use serde::Serialize;
 use std::{
     fmt,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
@@ -189,59 +186,25 @@ impl CorpusEntry {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct GlobalCorpusMetrics {
-    // Number of edges seen during the invariant run.
-    cumulative_edges_seen: AtomicUsize,
-    // Number of features (new hitcount bin of previously hit edge) seen during the invariant run.
-    cumulative_features_seen: AtomicUsize,
-    // Number of corpus entries.
-    corpus_count: AtomicUsize,
-}
-
-impl fmt::Display for GlobalCorpusMetrics {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.load().fmt(f)
-    }
-}
-
-impl GlobalCorpusMetrics {
-    pub(crate) fn load(&self) -> CorpusMetrics {
-        CorpusMetrics {
-            cumulative_edges_seen: self.cumulative_edges_seen.load(Ordering::Relaxed),
-            cumulative_features_seen: self.cumulative_features_seen.load(Ordering::Relaxed),
-            corpus_count: self.corpus_count.load(Ordering::Relaxed),
-        }
-    }
-}
-
 #[derive(Serialize, Default, Clone)]
 pub(crate) struct CorpusMetrics {
-    // Number of edges seen during the invariant run.
-    cumulative_edges_seen: usize,
-    // Number of features (new hitcount bin of previously hit edge) seen during the invariant run.
-    cumulative_features_seen: usize,
-    // Number of corpus entries.
-    corpus_count: usize,
+    // Number of unique edges seen during the invariant run.
+    pub(crate) edge_count: usize,
 }
 
 impl fmt::Display for CorpusMetrics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f)?;
-        writeln!(f, "        - cumulative edges seen: {}", self.cumulative_edges_seen)?;
-        writeln!(f, "        - cumulative features seen: {}", self.cumulative_features_seen)?;
-        write!(f, "        - corpus count: {}", self.corpus_count)?;
+        write!(f, "        - edge count: {}", self.edge_count)?;
         Ok(())
     }
 }
 
 impl CorpusMetrics {
-    /// Records number of new edges or features explored during the campaign.
-    pub fn update_seen(&mut self, is_edge: bool) {
+    /// Records a new edge if `is_edge` is true.
+    pub fn record_edge_if(&mut self, is_edge: bool) {
         if is_edge {
-            self.cumulative_edges_seen += 1;
-        } else {
-            self.cumulative_features_seen += 1;
+            self.edge_count += 1;
         }
     }
 }
@@ -280,8 +243,6 @@ pub struct WorkerCorpus {
     /// Worker Dir
     /// corpus_dir/worker1/
     worker_dir: Option<PathBuf>,
-    /// Metrics at last sync - used to calculate deltas while syncing with global metrics
-    last_sync_metrics: CorpusMetrics,
 }
 
 /// Stats returned from a corpus sync.
@@ -366,7 +327,6 @@ impl WorkerCorpus {
                 .and_then(|s| s.trim().parse::<u64>().ok())
                 .unwrap_or(0),
             worker_dir,
-            last_sync_metrics: Default::default(),
         };
 
         if id == 0
@@ -390,7 +350,7 @@ impl WorkerCorpus {
                             call_result.merge_edge_coverage_detailed(&mut worker.history_map);
                         cumulative_edges.extend(edges);
                         if new_coverage {
-                            worker.metrics.update_seen(is_edge);
+                            worker.metrics.record_edge_if(is_edge);
                         }
 
                         // Commit only when running invariant / stateful tests.
@@ -407,8 +367,6 @@ impl WorkerCorpus {
                         }
                     }
                 }
-
-                worker.metrics.corpus_count += 1;
 
                 debug!(
                     target: "corpus",
@@ -481,7 +439,6 @@ impl WorkerCorpus {
 
         // This includes reverting txs in the corpus and `can_continue` removes
         // them. We want this as it is new coverage and may help reach the other branch.
-        self.metrics.corpus_count += 1;
         self.in_memory_corpus.push(corpus);
     }
 
@@ -500,7 +457,7 @@ impl WorkerCorpus {
         let (new_coverage, is_edge, edges) =
             call_result.merge_edge_coverage_detailed(&mut self.history_map);
         if new_coverage {
-            self.metrics.update_seen(is_edge);
+            self.metrics.record_edge_if(is_edge);
         }
         (new_coverage, edges)
     }
@@ -1048,7 +1005,7 @@ impl WorkerCorpus {
                     call_result.merge_edge_coverage_detailed(&mut self.history_map);
 
                 if new_coverage {
-                    self.metrics.update_seen(is_edge);
+                    self.metrics.record_edge_if(is_edge);
                     new_coverage_on_sync = true;
                     corpus_edges.extend(edges);
                 }
@@ -1195,45 +1152,6 @@ impl WorkerCorpus {
         Ok(exported)
     }
 
-    // TODO(dani): currently only master syncs metrics?
-    /// Syncs local metrics with global corpus metrics by calculating and applying deltas.
-    pub(crate) fn sync_metrics(&mut self, global_corpus_metrics: &GlobalCorpusMetrics) {
-        // Calculate delta metrics since last sync.
-        let edges_delta = self
-            .metrics
-            .cumulative_edges_seen
-            .saturating_sub(self.last_sync_metrics.cumulative_edges_seen);
-        let features_delta = self
-            .metrics
-            .cumulative_features_seen
-            .saturating_sub(self.last_sync_metrics.cumulative_features_seen);
-        // For corpus count and favored items, calculate deltas.
-        let corpus_count_delta =
-            self.metrics.corpus_count as isize - self.last_sync_metrics.corpus_count as isize;
-        // Add delta values to global metrics.
-        if edges_delta > 0 {
-            global_corpus_metrics.cumulative_edges_seen.fetch_add(edges_delta, Ordering::Relaxed);
-        }
-        if features_delta > 0 {
-            global_corpus_metrics
-                .cumulative_features_seen
-                .fetch_add(features_delta, Ordering::Relaxed);
-        }
-
-        if corpus_count_delta > 0 {
-            global_corpus_metrics
-                .corpus_count
-                .fetch_add(corpus_count_delta as usize, Ordering::Relaxed);
-        } else if corpus_count_delta < 0 {
-            global_corpus_metrics
-                .corpus_count
-                .fetch_sub((-corpus_count_delta) as usize, Ordering::Relaxed);
-        }
-
-        // Store current metrics as last sync metrics for next delta calculation.
-        self.last_sync_metrics = self.metrics.clone();
-    }
-
     /// Syncs the workers in_memory_corpus and history_map with the findings from other workers.
     #[instrument(skip_all)]
     pub fn sync(
@@ -1242,11 +1160,8 @@ impl WorkerCorpus {
         executor: &Executor,
         fuzzed_function: Option<&Function>,
         fuzzed_contracts: Option<&FuzzRunIdentifiedContracts>,
-        global_corpus_metrics: &GlobalCorpusMetrics,
     ) -> Result<SyncStats> {
         trace!(target: "corpus", "syncing");
-
-        self.sync_metrics(global_corpus_metrics);
 
         let cal_timer = std::time::Instant::now();
         let imported = self.calibrate(executor, fuzzed_function, fuzzed_contracts)?;
@@ -1439,7 +1354,6 @@ mod tests {
             new_entry_indices: Default::default(),
             last_sync_timestamp: 0,
             worker_dir: Some(corpus_root),
-            last_sync_metrics: CorpusMetrics::default(),
         }
     }
 

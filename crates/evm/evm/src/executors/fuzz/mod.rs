@@ -1,6 +1,6 @@
 use crate::executors::{
     DURATION_BETWEEN_METRICS_REPORT, EarlyExit, Executor, FuzzTestTimer, RawCallResult,
-    corpus::{GlobalCorpusMetrics, WorkerCorpus},
+    corpus::WorkerCorpus,
 };
 use alloy_dyn_abi::JsonAbiExt;
 use alloy_json_abi::Function;
@@ -100,8 +100,6 @@ struct SharedFuzzState {
     total_rejects: Arc<AtomicU32>,
     /// Fuzz timer
     timer: FuzzTestTimer,
-    /// Global corpus metrics
-    global_corpus_metrics: GlobalCorpusMetrics,
 
     /// Global test suite early exit.
     global_early_exit: EarlyExit,
@@ -117,7 +115,6 @@ impl SharedFuzzState {
             failed_worker_id: OnceLock::new(),
             total_rejects: Arc::new(AtomicU32::new(0)),
             timer: FuzzTestTimer::new(timeout),
-            global_corpus_metrics: GlobalCorpusMetrics::default(),
             global_early_exit: early_exit,
             local_early_exit: EarlyExit::new(true),
         }
@@ -488,13 +485,7 @@ impl FuzzedExecutor {
                 runs_since_sync += 1;
                 if runs_since_sync >= sync_threshold {
                     let timer = Instant::now();
-                    corpus.sync(
-                        self.num_workers,
-                        &executor,
-                        Some(func),
-                        None,
-                        &shared_state.global_corpus_metrics,
-                    )?;
+                    corpus.sync(self.num_workers, &executor, Some(func), None)?;
                     trace!("finished corpus sync in {:?}", timer.elapsed());
                     runs_since_sync = 0;
                 }
@@ -539,20 +530,19 @@ impl FuzzedExecutor {
 
                         if worker_id == 0 && self.config.corpus.collect_edge_coverage() {
                             if let Some(progress) = progress {
-                                corpus.sync_metrics(&shared_state.global_corpus_metrics);
-                                progress
-                                    .set_message(format!("{}", shared_state.global_corpus_metrics));
+                                progress.set_message(format!(
+                                    "\n        - edge count: {}",
+                                    corpus.metrics.edge_count,
+                                ));
                             } else if last_metrics_report.elapsed()
                                 > DURATION_BETWEEN_METRICS_REPORT
                             {
-                                corpus.sync_metrics(&shared_state.global_corpus_metrics);
-                                // Display metrics inline.
                                 let metrics = json!({
                                     "timestamp": SystemTime::now()
                                         .duration_since(UNIX_EPOCH)?
                                         .as_secs(),
                                     "test": func.name,
-                                    "metrics": shared_state.global_corpus_metrics.load(),
+                                    "edge_count": corpus.metrics.edge_count,
                                 });
                                 let _ = sh_println!("{metrics}");
                                 last_metrics_report = Instant::now();
