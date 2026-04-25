@@ -37,25 +37,27 @@
 use crate::executors::{Executor, RawCallResult, invariant::execute_tx};
 use alloy_dyn_abi::JsonAbiExt;
 use alloy_json_abi::Function;
-use alloy_primitives::{Bytes, I256};
+use alloy_primitives::{Address, Bytes, I256, U256};
 use eyre::{Result, eyre};
 use foundry_common::sh_warn;
 use foundry_config::FuzzCorpusConfig;
 use foundry_evm_core::evm::FoundryEvmNetwork;
 use foundry_evm_fuzz::{
-    BasicTxDetails,
-    invariant::FuzzRunIdentifiedContracts,
-    strategies::{EvmFuzzState, mutate_param_value},
+    BasicTxDetails, CallDetails,
+    invariant::{FuzzRunIdentifiedContracts, SenderFilters},
+    strategies::{EvmFuzzState, is_shrinkable_param_value, mutate_param_value, shrink_param_value},
 };
 use proptest::{
-    prelude::{Just, Rng, Strategy},
-    prop_oneof,
+    prelude::{Rng, Strategy},
     strategy::{BoxedStrategy, ValueTree},
     test_runner::TestRunner,
 };
+use rand::distr::{Distribution, weighted::WeightedIndex};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     fmt,
+    ops::Range,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -77,21 +79,392 @@ const COVERAGE_MAP_SIZE: usize = 65536;
 /// 4KiB is usually the minimum file size on popular file systems.
 const GZIP_THRESHOLD: usize = 4 * 1024;
 
-/// Possible mutation strategies to apply on a call sequence.
-#[derive(Debug, Clone)]
-enum MutationType {
-    /// Splice original call sequence.
-    Splice,
-    /// Repeat selected call several times.
-    Repeat,
-    /// Interleave calls from two random call sequences.
-    Interleave,
-    /// Replace prefix of the original call sequence with new calls.
+#[derive(Debug, Clone, Copy)]
+enum MutationPosition {
+    Any,
     Prefix,
-    /// Replace suffix of the original call sequence with new calls.
     Suffix,
-    /// ABI mutate random args of selected call in sequence.
-    Abi,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MutationSource {
+    Fresh,
+    Corpus,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MutationAction {
+    Splice,
+    Repeat,
+    Interleave,
+    Mutate,
+    Shrink,
+    Swap,
+    Delete,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ArgMutationRounds {
+    OneOrNone,
+    OneOrMany,
+}
+
+impl ArgMutationRounds {
+    fn count<R: Rng + ?Sized>(self, input_count: usize, rng: &mut R) -> usize {
+        if input_count == 0 {
+            return 0;
+        }
+
+        match self {
+            Self::OneOrNone => {
+                if rng.random_ratio(50, 100) {
+                    1
+                } else {
+                    0
+                }
+            }
+            Self::OneOrMany => rng.random_range(0..=input_count).max(1),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TxMutationPolicy {
+    args: ArgMutationRounds,
+}
+
+impl TxMutationPolicy {
+    const FRESH: Self = Self { args: ArgMutationRounds::OneOrNone };
+    const CORPUS: Self = Self { args: ArgMutationRounds::OneOrMany };
+}
+
+/// Possible mutation strategy to apply on a call sequence.
+#[derive(Debug, Clone, Copy)]
+struct MutationType {
+    position: MutationPosition,
+    source: MutationSource,
+    action: MutationAction,
+}
+
+impl MutationType {
+    const fn new(
+        position: MutationPosition,
+        source: MutationSource,
+        action: MutationAction,
+    ) -> Self {
+        Self { position, source, action }
+    }
+}
+
+/// One lazily materialized slot in an invariant input sequence.
+#[derive(Clone)]
+enum PlannedSlot {
+    /// Replay an exact transaction from the sequence corpus.
+    Replay(BasicTxDetails),
+    /// Generate a fresh transaction when this slot is consumed.
+    Fresh,
+    /// Replay a corpus transaction after applying mutation.
+    CorpusMutate(BasicTxDetails),
+    /// Replay a corpus transaction after simplifying it.
+    Shrink(BasicTxDetails),
+}
+
+/// Sparse invariant input sequence. Missing slots are treated as fresh transactions.
+pub(crate) struct SequencePlan {
+    seq_len: usize,
+    slots: BTreeMap<usize, PlannedSlot>,
+}
+
+impl SequencePlan {
+    fn new(seq_len: usize) -> Self {
+        Self { seq_len: seq_len.max(1), slots: BTreeMap::new() }
+    }
+
+    fn from_replay_seq(seq: impl IntoIterator<Item = BasicTxDetails>) -> Self {
+        let slots = seq
+            .into_iter()
+            .enumerate()
+            .map(|(idx, tx)| (idx, PlannedSlot::Replay(tx)))
+            .collect::<BTreeMap<_, _>>();
+        Self { seq_len: slots.len().max(1), slots }
+    }
+
+    fn replay(&mut self, idx: usize, tx: BasicTxDetails) {
+        self.slots.insert(idx, PlannedSlot::Replay(tx));
+    }
+
+    fn fresh(&mut self, idx: usize) {
+        self.slots.insert(idx, PlannedSlot::Fresh);
+    }
+
+    fn corpus_mutate(&mut self, idx: usize, tx: BasicTxDetails) {
+        self.slots.insert(idx, PlannedSlot::CorpusMutate(tx));
+    }
+
+    fn shrink(&mut self, idx: usize, tx: BasicTxDetails) {
+        self.slots.insert(idx, PlannedSlot::Shrink(tx));
+    }
+
+    fn slot(&self, depth: usize) -> Option<&PlannedSlot> {
+        if depth < self.seq_len { self.slots.get(&depth) } else { None }
+    }
+}
+
+type CallSeedKey = (Address, [u8; 4]);
+
+#[derive(Clone)]
+struct CallSeed {
+    call_details: CallDetails,
+}
+
+impl PartialEq for CallSeed {
+    fn eq(&self, other: &Self) -> bool {
+        self.call_details.target == other.call_details.target
+            && self.call_details.calldata == other.call_details.calldata
+            && self.call_details.value == other.call_details.value
+    }
+}
+
+impl Eq for CallSeed {}
+
+#[derive(Default)]
+struct SeedCalls {
+    by_key: BTreeMap<CallSeedKey, Vec<CallSeed>>,
+}
+
+impl SeedCalls {
+    fn key(call_details: &CallDetails) -> Option<CallSeedKey> {
+        if call_details.calldata.len() < 4 {
+            return None;
+        }
+
+        let mut selector = [0; 4];
+        selector.copy_from_slice(&call_details.calldata[..4]);
+        Some((call_details.target, selector))
+    }
+
+    fn insert_tx(&mut self, tx: &BasicTxDetails) {
+        let Some(key) = Self::key(&tx.call_details) else {
+            return;
+        };
+
+        let seed = CallSeed { call_details: tx.call_details.clone() };
+        let bucket = self.by_key.entry(key).or_default();
+        if !bucket.contains(&seed) {
+            bucket.push(seed);
+        }
+    }
+
+    fn pick_for_tx<R: Rng + ?Sized>(
+        &self,
+        tx: &BasicTxDetails,
+        rng: &mut R,
+    ) -> Option<CallDetails> {
+        let key = Self::key(&tx.call_details)?;
+        let bucket = self.by_key.get(&key)?;
+        let seed = bucket.get(rng.random_range(0..bucket.len()))?;
+        Some(seed.call_details.clone())
+    }
+}
+
+const CORPUS_MUTATION_WEIGHTS: &[(MutationType, u32)] = &[
+    // Structural sequence operators.
+    (MutationType::new(MutationPosition::Any, MutationSource::Corpus, MutationAction::Splice), 100),
+    (
+        MutationType::new(
+            MutationPosition::Any,
+            MutationSource::Corpus,
+            MutationAction::Interleave,
+        ),
+        100,
+    ),
+    (
+        MutationType::new(MutationPosition::Suffix, MutationSource::Corpus, MutationAction::Repeat),
+        500,
+    ),
+    (
+        MutationType::new(MutationPosition::Suffix, MutationSource::Corpus, MutationAction::Swap),
+        500,
+    ),
+    (
+        MutationType::new(MutationPosition::Suffix, MutationSource::Corpus, MutationAction::Delete),
+        500,
+    ),
+    (
+        MutationType::new(MutationPosition::Prefix, MutationSource::Corpus, MutationAction::Repeat),
+        300,
+    ),
+    (
+        MutationType::new(MutationPosition::Prefix, MutationSource::Corpus, MutationAction::Swap),
+        300,
+    ),
+    (
+        MutationType::new(MutationPosition::Prefix, MutationSource::Corpus, MutationAction::Delete),
+        300,
+    ),
+    // Fresh slots are generated lazily and receive only local mutation during materialization.
+    (
+        MutationType::new(MutationPosition::Suffix, MutationSource::Fresh, MutationAction::Mutate),
+        500,
+    ),
+    (
+        MutationType::new(MutationPosition::Suffix, MutationSource::Corpus, MutationAction::Mutate),
+        500,
+    ),
+    (
+        MutationType::new(MutationPosition::Suffix, MutationSource::Corpus, MutationAction::Shrink),
+        500,
+    ),
+    (
+        MutationType::new(MutationPosition::Prefix, MutationSource::Fresh, MutationAction::Mutate),
+        300,
+    ),
+    (
+        MutationType::new(MutationPosition::Prefix, MutationSource::Corpus, MutationAction::Mutate),
+        300,
+    ),
+    (
+        MutationType::new(MutationPosition::Prefix, MutationSource::Corpus, MutationAction::Shrink),
+        300,
+    ),
+    (MutationType::new(MutationPosition::Any, MutationSource::Fresh, MutationAction::Mutate), 300),
+    (MutationType::new(MutationPosition::Any, MutationSource::Corpus, MutationAction::Mutate), 300),
+    (MutationType::new(MutationPosition::Any, MutationSource::Corpus, MutationAction::Shrink), 300),
+];
+
+fn weighted_mutation<R: Rng + ?Sized>(rng: &mut R) -> Result<MutationType> {
+    let dist = WeightedIndex::new(CORPUS_MUTATION_WEIGHTS.iter().map(|(_, weight)| *weight))
+        .map_err(|err| eyre!("invalid corpus mutation weights: {err}"))?;
+    Ok(CORPUS_MUTATION_WEIGHTS[dist.sample(rng)].0)
+}
+
+fn mutation_indices<R: Rng + ?Sized>(
+    position: MutationPosition,
+    seq_len: usize,
+    rng: &mut R,
+) -> Vec<usize> {
+    match position {
+        MutationPosition::Any => vec![rng.random_range(0..seq_len)],
+        MutationPosition::Prefix => (0..rng.random_range(0..seq_len)).collect(),
+        MutationPosition::Suffix => {
+            let start = seq_len - rng.random_range(0..seq_len);
+            (start..seq_len).collect()
+        }
+    }
+}
+
+fn positioned_range<R: Rng + ?Sized>(
+    position: MutationPosition,
+    seq_len: usize,
+    min_len: usize,
+    rng: &mut R,
+) -> Option<Range<usize>> {
+    if seq_len < min_len {
+        return None;
+    }
+
+    match position {
+        MutationPosition::Any => Some(0..seq_len),
+        MutationPosition::Prefix => Some(0..rng.random_range(min_len..=seq_len)),
+        MutationPosition::Suffix => {
+            let len = rng.random_range(min_len..=seq_len);
+            Some((seq_len - len)..seq_len)
+        }
+    }
+}
+
+fn random_distinct_pair<R: Rng + ?Sized>(
+    range: Range<usize>,
+    rng: &mut R,
+) -> Option<(usize, usize)> {
+    if range.len() < 2 {
+        return None;
+    }
+
+    let start = range.start;
+    let end = range.end;
+    let idx1 = rng.random_range(range.clone());
+    let mut idx2 = rng.random_range(start..end - 1);
+    if idx2 >= idx1 {
+        idx2 += 1;
+    }
+    Some((idx1, idx2))
+}
+
+fn interleave_prefixes(
+    first: &[BasicTxDetails],
+    first_len: usize,
+    second: &[BasicTxDetails],
+    second_len: usize,
+) -> Vec<BasicTxDetails> {
+    let mut interleaved = Vec::with_capacity(first_len + second_len);
+    let mut first_iter = first.iter().take(first_len);
+    let mut second_iter = second.iter().take(second_len);
+
+    loop {
+        match (first_iter.next(), second_iter.next()) {
+            (Some(a), Some(b)) => {
+                interleaved.push(a.clone());
+                interleaved.push(b.clone());
+            }
+            (Some(a), None) => {
+                interleaved.push(a.clone());
+                interleaved.extend(first_iter.cloned());
+                break;
+            }
+            (None, Some(b)) => {
+                interleaved.push(b.clone());
+                interleaved.extend(second_iter.cloned());
+                break;
+            }
+            (None, None) => break,
+        }
+    }
+
+    interleaved
+}
+
+fn mutation_plan_from_corpus<R: Rng + ?Sized>(
+    seq: &[BasicTxDetails],
+    position: MutationPosition,
+    source: MutationSource,
+    action: MutationAction,
+    rng: &mut R,
+) -> SequencePlan {
+    let mut plan = SequencePlan::from_replay_seq(seq.to_vec());
+    for idx in mutation_indices(position, seq.len(), rng) {
+        match (source, action) {
+            (MutationSource::Fresh, MutationAction::Mutate) => plan.fresh(idx),
+            (MutationSource::Corpus, MutationAction::Mutate) => {
+                plan.corpus_mutate(idx, seq[idx].clone())
+            }
+            (MutationSource::Corpus, MutationAction::Shrink) => plan.shrink(idx, seq[idx].clone()),
+            _ => unreachable!("unsupported planned mutation: {source:?} {action:?}"),
+        }
+    }
+    plan
+}
+
+fn shrink_u256_towards_zero<R: Rng + ?Sized>(value: U256, rng: &mut R) -> U256 {
+    if value.is_zero() {
+        return U256::ZERO;
+    }
+
+    match rng.random_range(0..=9) {
+        0..=5 => U256::ZERO,
+        6..=8 => value / U256::from(2),
+        _ => value / U256::from(4),
+    }
+}
+
+fn normalize_shrunk_delay(tx: &mut BasicTxDetails, warp: U256, roll: U256) {
+    if warp.is_zero() || roll.is_zero() {
+        tx.warp = None;
+        tx.roll = None;
+    } else {
+        tx.warp = Some(warp);
+        tx.roll = Some(roll);
+    }
 }
 
 /// Persisted optimization state: the best value found and the sequence that produced it.
@@ -265,8 +638,6 @@ pub struct WorkerCorpus {
     pub(crate) metrics: CorpusMetrics,
     /// Fuzzed calls generator.
     tx_generator: BoxedStrategy<BasicTxDetails>,
-    /// Call sequence mutation strategy type generator used by stateful fuzzing.
-    mutation_generator: BoxedStrategy<MutationType>,
     /// Identifier of current mutated entry for this worker.
     current_mutated: Option<Uuid>,
     /// Config
@@ -284,6 +655,8 @@ pub struct WorkerCorpus {
     optimization_best_value: Option<I256>,
     /// Optimization mode: the call sequence that produced the best value.
     optimization_best_sequence: Vec<BasicTxDetails>,
+    /// Stored call seeds keyed by target and selector.
+    seed_calls: SeedCalls,
 }
 
 impl WorkerCorpus {
@@ -296,16 +669,6 @@ impl WorkerCorpus {
         fuzzed_function: Option<&Function>,
         fuzzed_contracts: Option<&FuzzRunIdentifiedContracts>,
     ) -> Result<Self> {
-        let mutation_generator = prop_oneof![
-            Just(MutationType::Splice),
-            Just(MutationType::Repeat),
-            Just(MutationType::Interleave),
-            Just(MutationType::Prefix),
-            Just(MutationType::Suffix),
-            Just(MutationType::Abi),
-        ]
-        .boxed();
-
         let worker_dir = config.corpus_dir.as_ref().map(|corpus_dir| {
             let worker_dir = corpus_dir.join(format!("{WORKER}{id}"));
             let worker_corpus = worker_dir.join(CORPUS_DIR);
@@ -325,6 +688,7 @@ impl WorkerCorpus {
         let mut failed_replays = 0;
         let mut optimization_best_value = None;
         let mut optimization_best_sequence = vec![];
+        let mut seed_calls = SeedCalls::default();
 
         if id == 0
             && let Some(corpus_dir) = &config.corpus_dir
@@ -376,6 +740,7 @@ impl WorkerCorpus {
                             .merge_all_coverage(&mut history_map, &mut sancov_history_map);
                         if new_coverage {
                             metrics.update_seen(is_edge);
+                            seed_calls.insert_tx(tx);
                         }
 
                         // Commit only when running invariant / stateful tests.
@@ -415,7 +780,6 @@ impl WorkerCorpus {
             failed_replays,
             metrics,
             tx_generator,
-            mutation_generator,
             current_mutated: None,
             config: config.into(),
             new_entry_indices: Default::default(),
@@ -424,6 +788,7 @@ impl WorkerCorpus {
             last_sync_metrics: Default::default(),
             optimization_best_value,
             optimization_best_sequence,
+            seed_calls,
         })
     }
 
@@ -567,40 +932,35 @@ impl WorkerCorpus {
         new_coverage
     }
 
+    /// Records a concrete call seed that produced per-call coverage.
+    pub fn record_call_seed(&mut self, tx: &BasicTxDetails) {
+        self.seed_calls.insert_tx(tx);
+    }
+
     /// Generates new call sequence from in memory corpus. Evicts oldest corpus mutated more than
     /// configured max mutations value. Used by invariant test campaigns.
     #[instrument(skip_all)]
-    pub fn new_inputs(
-        &mut self,
-        test_runner: &mut TestRunner,
-        fuzz_state: &EvmFuzzState,
-        targeted_contracts: &FuzzRunIdentifiedContracts,
-    ) -> Result<Vec<BasicTxDetails>> {
-        let mut new_seq = vec![];
-
+    pub fn new_inputs(&mut self, test_runner: &mut TestRunner) -> Result<SequencePlan> {
         // Early return with first_input only if corpus dir / coverage guided fuzzing not
         // configured.
         if !self.config.is_coverage_guided() {
-            new_seq.push(self.new_tx(test_runner)?);
-            return Ok(new_seq);
+            return Ok(SequencePlan::new(1));
         };
+
+        let mut plan = SequencePlan::new(1);
 
         if !self.in_memory_corpus.is_empty() {
             self.evict_oldest_corpus()?;
 
-            let mutation_type = self
-                .mutation_generator
-                .new_tree(test_runner)
-                .map_err(|err| eyre!("Could not generate mutation type {err}"))?
-                .current();
+            let mutation_type = weighted_mutation(test_runner.rng())?;
 
             let rng = test_runner.rng();
             let corpus_len = self.in_memory_corpus.len();
             let primary = &self.in_memory_corpus[rng.random_range(0..corpus_len)];
-            let secondary = &self.in_memory_corpus[rng.random_range(0..corpus_len)];
 
-            match mutation_type {
-                MutationType::Splice => {
+            match mutation_type.action {
+                MutationAction::Splice => {
+                    let secondary = &self.in_memory_corpus[rng.random_range(0..corpus_len)];
                     trace!(target: "corpus", "splice {} and {}", primary.uuid, secondary.uuid);
 
                     self.current_mutated = Some(primary.uuid);
@@ -611,89 +971,137 @@ impl WorkerCorpus {
                     let start2 = rng.random_range(0..secondary.tx_seq.len());
                     let end2 = rng.random_range(start2..secondary.tx_seq.len());
 
+                    let mut idx = 0;
                     for tx in primary.tx_seq.iter().take(end1).skip(start1) {
-                        new_seq.push(tx.clone());
+                        plan.replay(idx, tx.clone());
+                        idx += 1;
                     }
                     for tx in secondary.tx_seq.iter().take(end2).skip(start2) {
-                        new_seq.push(tx.clone());
+                        plan.replay(idx, tx.clone());
+                        idx += 1;
                     }
+                    plan.seq_len = idx.max(1);
                 }
-                MutationType::Repeat => {
-                    let corpus = if rng.random::<bool>() { primary } else { secondary };
-                    trace!(target: "corpus", "repeat {}", corpus.uuid);
+                MutationAction::Repeat => {
+                    let corpus = primary;
+                    trace!(
+                        target: "corpus",
+                        "repeat {:?} in {}",
+                        mutation_type.position,
+                        corpus.uuid
+                    );
 
                     self.current_mutated = Some(corpus.uuid);
 
-                    new_seq = corpus.tx_seq.clone();
-                    let start = rng.random_range(0..corpus.tx_seq.len());
-                    let end = rng.random_range(start..corpus.tx_seq.len());
-                    let item_idx = rng.random_range(0..corpus.tx_seq.len());
-                    let repeated = vec![new_seq[item_idx].clone(); end - start];
-                    new_seq.splice(start..end, repeated);
+                    let mut seq = corpus.tx_seq.clone();
+                    if let Some(range) = positioned_range(mutation_type.position, seq.len(), 1, rng)
+                    {
+                        let repetitions = rng.random_range(1..32); // TODO do we need take max depth into account?
+                        let item_idx = rng.random_range(range);
+                        let element = seq[item_idx].clone();
+                        for i in 0..repetitions {
+                            seq.insert(item_idx + i, element.clone());
+                        }
+                    }
+                    plan = SequencePlan::from_replay_seq(seq);
                 }
-                MutationType::Interleave => {
+                MutationAction::Interleave => {
+                    let secondary = &self.in_memory_corpus[rng.random_range(0..corpus_len)];
                     trace!(target: "corpus", "interleave {} with {}", primary.uuid, secondary.uuid);
 
                     self.current_mutated = Some(primary.uuid);
 
-                    for (tx1, tx2) in primary.tx_seq.iter().zip(secondary.tx_seq.iter()) {
-                        // TODO: chunks?
-                        let tx = if rng.random::<bool>() { tx1.clone() } else { tx2.clone() };
-                        new_seq.push(tx);
-                    }
+                    let len1 = rng.random_range(0..primary.tx_seq.len());
+                    let len2 = rng.random_range(0..secondary.tx_seq.len());
+                    plan = SequencePlan::from_replay_seq(interleave_prefixes(
+                        &primary.tx_seq,
+                        len1,
+                        &secondary.tx_seq,
+                        len2,
+                    ));
                 }
-                MutationType::Prefix => {
-                    let corpus = if rng.random::<bool>() { primary } else { secondary };
-                    trace!(target: "corpus", "overwrite prefix of {}", corpus.uuid);
+                MutationAction::Mutate => {
+                    let corpus = primary;
+                    trace!(
+                        target: "corpus",
+                        "mutate {:?} {:?} calls in {}",
+                        mutation_type.source,
+                        mutation_type.position,
+                        corpus.uuid
+                    );
 
                     self.current_mutated = Some(corpus.uuid);
 
-                    new_seq = corpus.tx_seq.clone();
-                    for i in 0..rng.random_range(0..=new_seq.len()) {
-                        new_seq[i] = self.new_tx(test_runner)?;
-                    }
+                    plan = mutation_plan_from_corpus(
+                        &corpus.tx_seq,
+                        mutation_type.position,
+                        mutation_type.source,
+                        mutation_type.action,
+                        rng,
+                    );
                 }
-                MutationType::Suffix => {
-                    let corpus = if rng.random::<bool>() { primary } else { secondary };
-                    trace!(target: "corpus", "overwrite suffix of {}", corpus.uuid);
+                MutationAction::Shrink => {
+                    let corpus = primary;
+                    trace!(
+                        target: "corpus",
+                        "shrink {:?} calls in {}",
+                        mutation_type.position,
+                        corpus.uuid
+                    );
 
                     self.current_mutated = Some(corpus.uuid);
 
-                    new_seq = corpus.tx_seq.clone();
-                    for i in new_seq.len() - rng.random_range(0..new_seq.len())..corpus.tx_seq.len()
+                    plan = mutation_plan_from_corpus(
+                        &corpus.tx_seq,
+                        mutation_type.position,
+                        mutation_type.source,
+                        mutation_type.action,
+                        rng,
+                    );
+                }
+                MutationAction::Swap => {
+                    let corpus = primary;
+                    trace!(
+                        target: "corpus",
+                        "swap {:?} calls in {}",
+                        mutation_type.position,
+                        corpus.uuid
+                    );
+                    self.current_mutated = Some(corpus.uuid);
+                    let mut seq = corpus.tx_seq.clone();
+                    if let Some(range) = positioned_range(mutation_type.position, seq.len(), 2, rng)
+                        && let Some((idx1, idx2)) = random_distinct_pair(range, rng)
                     {
-                        new_seq[i] = self.new_tx(test_runner)?;
+                        seq.swap(idx1, idx2);
                     }
+                    plan = SequencePlan::from_replay_seq(seq);
                 }
-                MutationType::Abi => {
-                    let targets = targeted_contracts.targets.lock();
-                    let corpus = if rng.random::<bool>() { primary } else { secondary };
-                    trace!(target: "corpus", "ABI mutate args of {}", corpus.uuid);
-
+                MutationAction::Delete => {
+                    let corpus = primary;
+                    trace!(
+                        target: "corpus",
+                        "delete {:?} call in {}",
+                        mutation_type.position,
+                        corpus.uuid
+                    );
                     self.current_mutated = Some(corpus.uuid);
-
-                    new_seq = corpus.tx_seq.clone();
-
-                    let idx = rng.random_range(0..new_seq.len());
-                    let tx = new_seq.get_mut(idx).unwrap();
-                    if let (_, Some(function)) = targets.fuzzed_artifacts(tx) {
-                        // TODO: add call_value to call details and mutate it as well as sender some
-                        // of the time.
-                        if !function.inputs.is_empty() {
-                            self.abi_mutate(tx, function, test_runner, fuzz_state)?;
-                        }
+                    let mut seq = corpus.tx_seq.clone();
+                    // Leave at least one call in the sequence.
+                    if seq.len() > 1
+                        && let Some(range) =
+                            positioned_range(mutation_type.position, seq.len(), 1, rng)
+                    {
+                        let idx = rng.random_range(range);
+                        seq.remove(idx);
                     }
+                    plan = SequencePlan::from_replay_seq(seq);
                 }
             }
         }
 
-        // Make sure the new sequence contains at least one tx to start fuzzing from.
-        if new_seq.is_empty() {
-            new_seq.push(self.new_tx(test_runner)?);
-        }
-        trace!(target: "corpus", "new sequence of {} calls generated", new_seq.len());
+        trace!(target: "corpus", "new sequence plan of {} calls generated", plan.seq_len);
 
-        Ok(new_seq)
+        Ok(plan)
     }
 
     /// Generates a new input from the shared in memory corpus.  Evicts oldest corpus mutated more
@@ -707,19 +1115,26 @@ impl WorkerCorpus {
     ) -> Result<Bytes> {
         // Early return if not running with coverage guided fuzzing.
         if !self.config.is_coverage_guided() {
-            return Ok(self.new_tx(test_runner)?.call_details.calldata);
+            return Ok(self.new_raw_tx(test_runner)?.call_details.calldata);
         }
 
         self.evict_oldest_corpus()?;
 
         let tx = if self.in_memory_corpus.is_empty() {
-            self.new_tx(test_runner)?
+            self.new_raw_tx(test_runner)?
         } else {
             let corpus = &self.in_memory_corpus
                 [test_runner.rng().random_range(0..self.in_memory_corpus.len())];
             self.current_mutated = Some(corpus.uuid);
             let mut tx = corpus.tx_seq.first().unwrap().clone();
-            self.abi_mutate(&mut tx, function, test_runner, fuzz_state)?;
+            self.mutate_tx_with_function(
+                &mut tx,
+                function,
+                test_runner,
+                fuzz_state,
+                None,
+                TxMutationPolicy::CORPUS,
+            )?;
             tx
         };
 
@@ -727,7 +1142,7 @@ impl WorkerCorpus {
     }
 
     /// Generates single call from corpus strategy.
-    pub fn new_tx(&self, test_runner: &mut TestRunner) -> Result<BasicTxDetails> {
+    pub fn new_raw_tx(&self, test_runner: &mut TestRunner) -> Result<BasicTxDetails> {
         Ok(self
             .tx_generator
             .new_tree(test_runner)
@@ -735,33 +1150,69 @@ impl WorkerCorpus {
             .current())
     }
 
+    /// Generates a fresh call and applies a small local mutation pass.
+    pub fn new_tx(
+        &self,
+        test_runner: &mut TestRunner,
+        fuzz_state: &EvmFuzzState,
+        targeted_contracts: &FuzzRunIdentifiedContracts,
+        senders: Option<&SenderFilters>,
+    ) -> Result<BasicTxDetails> {
+        let mut tx = self.new_raw_tx(test_runner)?;
+        if let Some(call_details) = self.seed_calls.pick_for_tx(&tx, test_runner.rng()) {
+            tx.call_details = call_details;
+        }
+        // TODO: sample msg.value from the fuzz dictionary during generation.
+        self.mutate_tx(
+            &mut tx,
+            test_runner,
+            fuzz_state,
+            targeted_contracts,
+            senders,
+            TxMutationPolicy::FRESH,
+        )?;
+        Ok(tx)
+    }
+
     /// Returns the next call to be used in call sequence.
-    /// If coverage guided fuzzing is not configured or if previous input was discarded then this is
-    /// a new tx from strategy.
-    /// If running with coverage guided fuzzing it returns a new call only when sequence
-    /// does not have enough entries, or randomly. Otherwise, returns the next call from initial
-    /// sequence.
+    /// Missing plan slots are materialized as fresh generated-and-locally-mutated transactions.
     pub fn generate_next_input(
         &mut self,
         test_runner: &mut TestRunner,
-        sequence: &[BasicTxDetails],
+        plan: &SequencePlan,
         discarded: bool,
         depth: usize,
+        fuzz_state: &EvmFuzzState,
+        targeted_contracts: &FuzzRunIdentifiedContracts,
+        senders: Option<&SenderFilters>,
     ) -> Result<BasicTxDetails> {
-        // Early return with new input if corpus dir / coverage guided fuzzing not configured or if
-        // call was discarded.
-        if self.config.corpus_dir.is_none() || discarded {
-            return self.new_tx(test_runner);
+        if discarded {
+            return self.new_tx(test_runner, fuzz_state, targeted_contracts, senders);
         }
 
-        // When running with coverage guided fuzzing enabled then generate new sequence if initial
-        // sequence's length is less than depth or randomly, to occasionally intermix new txs.
-        if depth > sequence.len().saturating_sub(1) || test_runner.rng().random_ratio(1, 10) {
-            return self.new_tx(test_runner);
+        match plan.slot(depth) {
+            Some(PlannedSlot::Replay(tx)) => Ok(tx.clone()),
+            Some(PlannedSlot::Fresh) | None => {
+                self.new_tx(test_runner, fuzz_state, targeted_contracts, senders)
+            }
+            Some(PlannedSlot::CorpusMutate(tx)) => {
+                let mut tx = tx.clone();
+                self.mutate_tx(
+                    &mut tx,
+                    test_runner,
+                    fuzz_state,
+                    targeted_contracts,
+                    senders,
+                    TxMutationPolicy::CORPUS,
+                )?;
+                Ok(tx)
+            }
+            Some(PlannedSlot::Shrink(tx)) => {
+                let mut tx = tx.clone();
+                self.shrink_tx(&mut tx, test_runner, targeted_contracts)?;
+                Ok(tx)
+            }
         }
-
-        // Continue with the next call initial sequence.
-        Ok(sequence[depth].clone())
     }
 
     /// Flush the oldest corpus mutated more than configured max mutations unless they are
@@ -792,18 +1243,37 @@ impl WorkerCorpus {
         Ok(())
     }
 
-    /// Mutates calldata of provided tx by abi decoding current values and randomly selecting the
-    /// inputs to change.
-    fn abi_mutate(
+    fn mutate_tx(
+        &self,
+        tx: &mut BasicTxDetails,
+        test_runner: &mut TestRunner,
+        fuzz_state: &EvmFuzzState,
+        targeted_contracts: &FuzzRunIdentifiedContracts,
+        senders: Option<&SenderFilters>,
+        policy: TxMutationPolicy,
+    ) -> Result<()> {
+        let targets = targeted_contracts.targets.lock();
+        let (_, Some(function)) = targets.fuzzed_artifacts(tx) else {
+            return Ok(());
+        };
+
+        self.mutate_tx_with_function(tx, function, test_runner, fuzz_state, senders, policy)
+    }
+
+    fn mutate_tx_with_function(
         &self,
         tx: &mut BasicTxDetails,
         function: &Function,
         test_runner: &mut TestRunner,
         fuzz_state: &EvmFuzzState,
+        _senders: Option<&SenderFilters>,
+        policy: TxMutationPolicy,
     ) -> Result<()> {
-        // let rng = test_runner.rng();
-        let mut arg_mutation_rounds =
-            test_runner.rng().random_range(0..=function.inputs.len()).max(1);
+        let mut arg_mutation_rounds = policy.args.count(function.inputs.len(), test_runner.rng());
+        if arg_mutation_rounds == 0 {
+            return Ok(());
+        }
+
         let round_arg_idx: Vec<usize> = if function.inputs.len() <= 1 {
             vec![0]
         } else {
@@ -834,6 +1304,122 @@ impl WorkerCorpus {
         tx.call_details.calldata =
             function.abi_encode_input(&prev_inputs).map_err(|e| eyre!(e.to_string()))?.into();
         Ok(())
+    }
+
+    fn shrink_tx(
+        &self,
+        tx: &mut BasicTxDetails,
+        test_runner: &mut TestRunner,
+        targeted_contracts: &FuzzRunIdentifiedContracts,
+    ) -> Result<()> {
+        {
+            let targets = targeted_contracts.targets.lock();
+            if let (_, Some(function)) = targets.fuzzed_artifacts(tx) {
+                self.shrink_tx_with_function(tx, function, test_runner)?;
+            }
+        }
+
+        self.shrink_tx_value(tx, test_runner);
+        self.shrink_tx_delay(tx, test_runner);
+        Ok(())
+    }
+
+    fn shrink_tx_with_function(
+        &self,
+        tx: &mut BasicTxDetails,
+        function: &Function,
+        test_runner: &mut TestRunner,
+    ) -> Result<()> {
+        if function.inputs.is_empty() {
+            return Ok(());
+        }
+
+        let input_types = function
+            .inputs
+            .iter()
+            .map(|input| input.selector_type().parse())
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut prev_inputs = function
+            .abi_decode_input(&tx.call_details.calldata[4..])
+            .map_err(|err| eyre!("failed to load previous inputs: {err}"))?;
+
+        let shrinkable = prev_inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, value)| {
+                is_shrinkable_param_value(&input_types[idx], value).then_some(idx)
+            })
+            .collect::<Vec<_>>();
+
+        if shrinkable.is_empty() {
+            return Ok(());
+        }
+
+        let shrinkable_len = shrinkable.len();
+        let mut remaining = test_runner.rng().random_range(1..=shrinkable.len());
+        let mut changed = false;
+        for (offset, idx) in shrinkable.into_iter().enumerate() {
+            let remaining_positions = shrinkable_len - offset;
+            let should_shrink = remaining == remaining_positions
+                || test_runner.rng().random_ratio(
+                    u32::try_from(remaining).expect("remaining shrink inputs exceeds u32"),
+                    u32::try_from(remaining_positions)
+                        .expect("remaining shrink positions exceeds u32"),
+                );
+
+            if !should_shrink {
+                continue;
+            }
+
+            if let Some(shrunk) =
+                shrink_param_value(&input_types[idx], prev_inputs[idx].clone(), test_runner)
+            {
+                prev_inputs[idx] = shrunk;
+                changed = true;
+            }
+
+            remaining -= 1;
+            if remaining == 0 {
+                break;
+            }
+        }
+
+        if !changed {
+            return Ok(());
+        }
+
+        tx.call_details.calldata =
+            function.abi_encode_input(&prev_inputs).map_err(|e| eyre!(e.to_string()))?.into();
+        Ok(())
+    }
+
+    fn shrink_tx_value(&self, tx: &mut BasicTxDetails, test_runner: &mut TestRunner) {
+        let Some(value) = tx.call_details.value else {
+            return;
+        };
+
+        let shrunk = shrink_u256_towards_zero(value, test_runner.rng());
+        tx.call_details.value = (!shrunk.is_zero()).then_some(shrunk);
+    }
+
+    fn shrink_tx_delay(&self, tx: &mut BasicTxDetails, test_runner: &mut TestRunner) {
+        let mut warp = tx.warp.unwrap_or(U256::ZERO);
+        let mut roll = tx.roll.unwrap_or(U256::ZERO);
+        if warp.is_zero() && roll.is_zero() {
+            return;
+        }
+
+        match test_runner.rng().random_range(0..=2) {
+            0 => warp = shrink_u256_towards_zero(warp, test_runner.rng()),
+            1 => roll = shrink_u256_towards_zero(roll, test_runner.rng()),
+            _ => {
+                warp = shrink_u256_towards_zero(warp, test_runner.rng());
+                roll = shrink_u256_towards_zero(roll, test_runner.rng());
+            }
+        }
+
+        normalize_shrunk_delay(tx, warp, roll);
     }
 
     // Sync Methods.
@@ -1207,17 +1793,19 @@ fn parse_corpus_filename(name: &str) -> Result<(Uuid, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::Address;
+    use proptest::prelude::Just;
     use std::fs;
 
     fn basic_tx() -> BasicTxDetails {
         BasicTxDetails {
             warp: None,
             roll: None,
+            deal: None,
             sender: Address::ZERO,
             call_details: foundry_evm_fuzz::CallDetails {
                 target: Address::ZERO,
                 calldata: Bytes::new(),
+                value: None,
             },
         }
     }
@@ -1250,7 +1838,6 @@ mod tests {
         let manager = WorkerCorpus {
             id: 0,
             tx_generator: tx_gen,
-            mutation_generator: Just(MutationType::Repeat).boxed(),
             config: config.into(),
             in_memory_corpus: vec![corpus],
             current_mutated: Some(seed_uuid),
@@ -1264,6 +1851,7 @@ mod tests {
             last_sync_metrics: CorpusMetrics::default(),
             optimization_best_value: None,
             optimization_best_sequence: vec![],
+            seed_calls: SeedCalls::default(),
         };
 
         (manager, seed_uuid)
@@ -1360,7 +1948,6 @@ mod tests {
         let mut manager = WorkerCorpus {
             id: 0,
             tx_generator: tx_gen,
-            mutation_generator: Just(MutationType::Repeat).boxed(),
             config: config.into(),
             in_memory_corpus: vec![favored, non_favored],
             current_mutated: None,
@@ -1374,6 +1961,7 @@ mod tests {
             last_sync_metrics: CorpusMetrics::default(),
             optimization_best_value: None,
             optimization_best_sequence: vec![],
+            seed_calls: SeedCalls::default(),
         };
 
         // First eviction should remove the non-favored one.
@@ -1387,5 +1975,27 @@ mod tests {
 
         // Ensure the evicted one was the non-favored uuid.
         assert!(manager.in_memory_corpus.iter().all(|c| c.uuid != non_favored_uuid));
+    }
+
+    #[test]
+    fn normalize_shrunk_delay_clears_both_sides_when_either_is_zero() {
+        let mut tx = basic_tx();
+        tx.warp = Some(U256::from(3u64));
+        tx.roll = Some(U256::from(7u64));
+
+        normalize_shrunk_delay(&mut tx, U256::ZERO, U256::from(2u64));
+
+        assert_eq!(tx.warp, None);
+        assert_eq!(tx.roll, None);
+    }
+
+    #[test]
+    fn normalize_shrunk_delay_keeps_non_zero_pair() {
+        let mut tx = basic_tx();
+
+        normalize_shrunk_delay(&mut tx, U256::from(5u64), U256::from(9u64));
+
+        assert_eq!(tx.warp, Some(U256::from(5u64)));
+        assert_eq!(tx.roll, Some(U256::from(9u64)));
     }
 }

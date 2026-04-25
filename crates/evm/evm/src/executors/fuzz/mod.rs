@@ -262,8 +262,13 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             &[BasicTxDetails {
                 warp: None,
                 roll: None,
+                deal: None,
                 sender: self.sender,
-                call_details: CallDetails { target: address, calldata: calldata.clone() },
+                call_details: CallDetails {
+                    target: address,
+                    calldata: calldata.clone(),
+                    value: None,
+                },
             }],
             new_coverage,
             None,
@@ -426,8 +431,9 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
         .prop_map(move |calldata| BasicTxDetails {
             warp: None,
             roll: None,
+            deal: None,
             sender: Default::default(),
-            call_details: CallDetails { target: Default::default(), calldata },
+            call_details: CallDetails { target: Default::default(), calldata, value: None },
         });
 
         let mut corpus = WorkerCorpus::new(

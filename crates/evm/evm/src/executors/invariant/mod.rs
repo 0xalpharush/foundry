@@ -253,6 +253,8 @@ struct InvariantTest<FEN: FoundryEvmNetwork> {
     fuzz_state: EvmFuzzState,
     // Contracts fuzzed by the invariant test.
     targeted_contracts: FuzzRunIdentifiedContracts,
+    // Sender filters (targeted/excluded senders).
+    sender_filters: SenderFilters,
     // Data collected during invariant runs.
     test_data: InvariantTestData<FEN>,
 }
@@ -262,6 +264,7 @@ impl<FEN: FoundryEvmNetwork> InvariantTest<FEN> {
     fn new(
         fuzz_state: EvmFuzzState,
         targeted_contracts: FuzzRunIdentifiedContracts,
+        sender_filters: SenderFilters,
         failures: InvariantFailures,
         last_call_results: Option<RawCallResult<FEN>>,
         branch_runner: TestRunner,
@@ -282,7 +285,7 @@ impl<FEN: FoundryEvmNetwork> InvariantTest<FEN> {
             optimization_best_value: None,
             optimization_best_sequence: vec![],
         };
-        Self { fuzz_state, targeted_contracts, test_data }
+        Self { fuzz_state, targeted_contracts, sender_filters, test_data }
     }
 
     /// Returns number of invariant test reverts.
@@ -481,15 +484,21 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
         let edge_coverage_enabled = self.config.corpus.collect_edge_coverage();
 
         'stop: while continue_campaign(runs) {
-            let initial_seq = corpus_manager.new_inputs(
+            let input_plan =
+                corpus_manager.new_inputs(&mut invariant_test.test_data.branch_runner)?;
+            let first_input = corpus_manager.generate_next_input(
                 &mut invariant_test.test_data.branch_runner,
+                &input_plan,
+                false,
+                0,
                 &invariant_test.fuzz_state,
                 &invariant_test.targeted_contracts,
+                Some(&invariant_test.sender_filters),
             )?;
 
             // Create current invariant run data.
             let mut current_run = InvariantTestRun::new(
-                initial_seq[0].clone(),
+                first_input,
                 // Before each run, we must reset the backend state.
                 self.executor.clone(),
                 self.config.depth as usize,
@@ -528,6 +537,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                 // Collect edge coverage and set the flag in the current run.
                 if corpus_manager.merge_edge_coverage(&mut call_result) {
                     current_run.new_coverage = true;
+                    corpus_manager.record_call_seed(tx);
                 }
 
                 if discarded {
@@ -676,9 +686,12 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
 
                 current_run.inputs.push(corpus_manager.generate_next_input(
                     &mut invariant_test.test_data.branch_runner,
-                    &initial_seq,
+                    &input_plan,
                     discarded,
                     current_run.depth as usize,
+                    &invariant_test.fuzz_state,
+                    &invariant_test.targeted_contracts,
+                    Some(&invariant_test.sender_filters),
                 )?);
             }
 
@@ -789,13 +802,13 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
     ) -> Result<(InvariantTest<FEN>, WorkerCorpus)> {
         // Finds out the chosen deployed contracts and/or senders.
         self.select_contract_artifacts(invariant_contract.address)?;
-        let (targeted_senders, targeted_contracts) =
+        let (sender_filters, targeted_contracts) =
             self.select_contracts_and_senders(invariant_contract.address)?;
 
         // Creates the invariant strategy.
         let strategy = invariant_strat(
             fuzz_state.clone(),
-            targeted_senders,
+            sender_filters.clone(),
             targeted_contracts.clone(),
             self.config.clone(),
             fuzz_fixtures.clone(),
@@ -878,6 +891,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
         let mut invariant_test = InvariantTest::new(
             fuzz_state,
             targeted_contracts,
+            sender_filters,
             failures,
             last_call_results,
             self.runner.clone(),
@@ -1293,7 +1307,8 @@ pub(crate) fn call_invariant_function<FEN: FoundryEvmNetwork>(
 }
 
 /// Executes a fuzz call and returns the result.
-/// Applies any block timestamp (warp) and block number (roll) adjustments before the call.
+/// Applies any block timestamp (warp), block number (roll), and balance (deal) adjustments before
+/// the call.
 pub(crate) fn execute_tx<FEN: FoundryEvmNetwork>(
     executor: &mut Executor<FEN>,
     tx: &BasicTxDetails,
@@ -1324,9 +1339,37 @@ pub(crate) fn execute_tx<FEN: FoundryEvmNetwork>(
         }
     }
 
-    executor
-        .call_raw(tx.sender, tx.call_details.target, tx.call_details.calldata.clone(), U256::ZERO)
-        .map_err(|e| eyre!(format!("Could not make raw evm call: {e}")))
+    let requested_value = tx.call_details.value.unwrap_or(U256::ZERO);
+    let value = if requested_value.is_zero() {
+        U256::ZERO
+    } else {
+        if let Some(deal) = tx.deal {
+            let current_balance = executor.get_balance(tx.sender)?;
+            executor.set_balance(tx.sender, current_balance + deal)?;
+        }
+
+        let sender_balance = executor.get_balance(tx.sender)?;
+        if requested_value <= sender_balance {
+            requested_value
+        } else if sender_balance > U256::ZERO {
+            requested_value % sender_balance
+        } else {
+            U256::ZERO
+        }
+    };
+
+    let mut call_result = executor
+        .call_raw(tx.sender, tx.call_details.target, tx.call_details.calldata.clone(), value)
+        .map_err(|e| eyre!(format!("Could not make raw evm call: {e}")))?;
+
+    // Propagate block adjustments to call result which will be committed.
+    if warp > 0 || roll > 0 {
+        let ts = call_result.evm_env.block_env.timestamp();
+        let num = call_result.evm_env.block_env.number();
+        call_result.evm_env.block_env.set_timestamp(ts + warp);
+        call_result.evm_env.block_env.set_number(num + roll);
+    }
+    Ok(call_result)
 }
 
 #[cfg(test)]

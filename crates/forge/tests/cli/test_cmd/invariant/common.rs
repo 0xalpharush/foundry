@@ -2678,3 +2678,212 @@ contract InvariantWarp is Test {
 "#
     ]]);
 });
+
+// Test that invariant fuzzer generates random msg.value for payable functions.
+// Based on the example from https://github.com/foundry-rs/foundry/pull/8644
+forgetest_init!(invariant_msg_value, |prj, cmd| {
+    prj.update_config(|config| {
+        config.fuzz.seed = Some(U256::from(42u32));
+        config.invariant.runs = 200;
+        config.invariant.depth = 20;
+    });
+
+    prj.add_test(
+        "InvariantMsgValue.t.sol",
+        r#"
+import "forge-std/Test.sol";
+
+contract ValueTarget {
+    bool public valueReceived;
+
+    // Payable function that tracks if any value was received
+    function deposit() external payable {
+        if (msg.value > 0) {
+            valueReceived = true;
+        }
+    }
+}
+
+contract InvariantMsgValue is Test {
+    ValueTarget target;
+    address sender1;
+    address sender2;
+
+    function setUp() public {
+        target = new ValueTarget();
+        // Create and fund specific senders
+        sender1 = makeAddr("sender1");
+        sender2 = makeAddr("sender2");
+        vm.deal(sender1, 1000 ether);
+        vm.deal(sender2, 1000 ether);
+        // Target only these funded senders
+        targetSender(sender1);
+        targetSender(sender2);
+        // Target only the ValueTarget contract
+        targetContract(address(target));
+    }
+
+    function invariant_value_never_received() public view {
+        require(!target.valueReceived(), "Value was received");
+    }
+}
+"#,
+    );
+
+    // The test should fail because the fuzzer generates msg.value > 0 for payable functions
+    // First check regular output format shows value=X
+    cmd.args(["test", "--mt", "invariant_value_never_received"])
+        .assert_failure()
+        .stdout_eq(str![[r#"
+...
+[FAIL: Value was received]
+	[Sequence] (original: [..], shrunk: 1)
+		sender=[..] addr=[test/InvariantMsgValue.t.sol:ValueTarget][..] value=[..] calldata=deposit() args=[]
+...
+"#]]);
+
+    // Now check solidity output format shows proper {value: X} syntax
+    cmd.forge_fuse().arg("clean").assert_success();
+    prj.update_config(|config| {
+        config.invariant.show_solidity = true;
+    });
+    cmd.forge_fuse()
+        .args(["test", "--mt", "invariant_value_never_received"])
+        .assert_failure()
+        .stdout_eq(str![[r#"
+...
+[FAIL: Value was received]
+	[Sequence] (original: [..], shrunk: 1)
+		vm.prank([..]);
+		ValueTarget([..]).deposit{value: [..]}();
+...
+"#]]);
+});
+
+// Test that without max_deal, payable calls with value fall back to 0 when sender has no balance.
+forgetest_init!(invariant_no_max_deal_fallback, |prj, cmd| {
+    prj.update_config(|config| {
+        config.fuzz.seed = Some(U256::from(42u32));
+        config.invariant.runs = 50;
+        config.invariant.depth = 10;
+    });
+
+    prj.add_test(
+        "InvariantNoMaxDeal.t.sol",
+        r#"
+import "forge-std/Test.sol";
+
+contract ValueTarget {
+    bool public valueReceived;
+
+    function deposit() external payable {
+        if (msg.value > 0) {
+            valueReceived = true;
+        }
+    }
+}
+
+contract InvariantNoMaxDeal is Test {
+    ValueTarget target;
+
+    function setUp() public {
+        target = new ValueTarget();
+        targetContract(address(target));
+        targetSender(makeAddr("sender1"));
+    }
+
+    function invariant_value_never_received() public view {
+        require(!target.valueReceived(), "Value was received");
+    }
+}
+"#,
+    );
+
+    // The test should pass because without max_deal and no sender balance,
+    // value falls back to 0
+    cmd.args(["test", "--mt", "invariant_value_never_received"]).assert_success().stdout_eq(str![
+        [r#"
+...
+[PASS] invariant_value_never_received() (runs: 50, calls: 500, reverts: 0)
+...
+"#]
+    ]);
+});
+
+// Test that with max_deal configured, the fuzzer deals balance to sender before tx,
+// enabling payable calls with msg.value > 0 to succeed.
+forgetest_init!(invariant_with_max_deal, |prj, cmd| {
+    prj.update_config(|config| {
+        config.fuzz.seed = Some(U256::from(42u32));
+        config.invariant.runs = 100;
+        config.invariant.depth = 20;
+        // Configure max_deal to fund senders before each tx
+        config.invariant.max_deal = Some(1_000_000_000_000_000_000); // 1 ETH in wei
+    });
+
+    prj.add_test(
+        "InvariantWithMaxDeal.t.sol",
+        r#"
+import "forge-std/Test.sol";
+
+contract ValueTarget {
+    bool public valueReceived;
+
+    function deposit() external payable {
+        if (msg.value > 0) {
+            valueReceived = true;
+        }
+    }
+}
+
+contract InvariantWithMaxDeal is Test {
+    ValueTarget target;
+
+    function setUp() public {
+        target = new ValueTarget();
+        // Target only the ValueTarget contract
+        targetContract(address(target));
+        // Use a custom sender with no initial balance
+        targetSender(makeAddr("sender1"));
+        // NOTE: No vm.deal() in setUp - max_deal config will fund sender1
+    }
+
+    // This invariant should FAIL because max_deal funds senders,
+    // allowing payable calls with msg.value > 0
+    function invariant_value_never_received() public view {
+        require(!target.valueReceived(), "Value was received");
+    }
+}
+"#,
+    );
+
+    // The test should fail because max_deal funds senders before each tx,
+    // enabling value > 0 to be sent
+    cmd.args(["test", "--mt", "invariant_value_never_received"])
+        .assert_failure()
+        .stdout_eq(str![[r#"
+...
+[FAIL: Value was received]
+	[Sequence] (original: [..], shrunk: 1)
+		sender=[..] addr=[test/InvariantWithMaxDeal.t.sol:ValueTarget][..] deal=[..] value=[..] calldata=deposit() args=[]
+...
+"#]]);
+
+    // Check solidity output format shows vm.deal()
+    cmd.forge_fuse().arg("clean").assert_success();
+    prj.update_config(|config| {
+        config.invariant.show_solidity = true;
+    });
+    cmd.forge_fuse()
+        .args(["test", "--mt", "invariant_value_never_received"])
+        .assert_failure()
+        .stdout_eq(str![[r#"
+...
+[FAIL: Value was received]
+	[Sequence] (original: [..], shrunk: 1)
+		vm.deal([..], [..].balance + [..]);
+		vm.prank([..]);
+		ValueTarget([..]).deposit{value: [..]}();
+...
+"#]]);
+});
