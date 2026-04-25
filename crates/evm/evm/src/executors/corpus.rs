@@ -50,7 +50,7 @@ use foundry_evm_fuzz::{
     },
 };
 use proptest::{
-    prelude::{Just, Rng, Strategy},
+    prelude::{Rng, Strategy},
     strategy::{BoxedStrategy, ValueTree},
     test_runner::TestRunner,
 };
@@ -1317,6 +1317,7 @@ fn parse_corpus_filename(name: &str) -> Result<(Uuid, u64)> {
 mod tests {
     use super::*;
     use alloy_primitives::Address;
+    use proptest::prelude::Just;
     use std::fs;
 
     fn basic_tx() -> BasicTxDetails {

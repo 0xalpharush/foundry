@@ -1355,10 +1355,10 @@ pub(crate) fn execute_tx<FEN: FoundryEvmNetwork>(
 
     // Propagate block adjustments to call result which will be committed.
     if warp > 0 || roll > 0 {
-        let ts = call_result.env.evm_env.block_env.timestamp();
-        let num = call_result.env.evm_env.block_env.number();
-        call_result.env.evm_env.block_env.set_timestamp(ts + warp);
-        call_result.env.evm_env.block_env.set_number(num + roll);
+        let ts = call_result.evm_env.block_env.timestamp();
+        let num = call_result.evm_env.block_env.number();
+        call_result.evm_env.block_env.set_timestamp(ts + warp);
+        call_result.evm_env.block_env.set_number(num + roll);
     }
     Ok(call_result)
 }
