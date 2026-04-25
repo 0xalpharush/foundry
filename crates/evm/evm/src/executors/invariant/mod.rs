@@ -484,8 +484,13 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
         let edge_coverage_enabled = self.config.corpus.collect_edge_coverage();
 
         'stop: while continue_campaign(runs) {
-            let initial_seq = corpus_manager.new_inputs(
+            let input_plan =
+                corpus_manager.new_inputs(&mut invariant_test.test_data.branch_runner)?;
+            let first_input = corpus_manager.generate_next_input(
                 &mut invariant_test.test_data.branch_runner,
+                &input_plan,
+                false,
+                0,
                 &invariant_test.fuzz_state,
                 &invariant_test.targeted_contracts,
                 Some(&invariant_test.sender_filters),
@@ -493,7 +498,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
 
             // Create current invariant run data.
             let mut current_run = InvariantTestRun::new(
-                initial_seq[0].clone(),
+                first_input,
                 // Before each run, we must reset the backend state.
                 self.executor.clone(),
                 self.config.depth as usize,
@@ -532,6 +537,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                 // Collect edge coverage and set the flag in the current run.
                 if corpus_manager.merge_edge_coverage(&mut call_result) {
                     current_run.new_coverage = true;
+                    corpus_manager.record_call_seed(tx);
                 }
 
                 if discarded {
@@ -680,9 +686,12 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
 
                 current_run.inputs.push(corpus_manager.generate_next_input(
                     &mut invariant_test.test_data.branch_runner,
-                    &initial_seq,
+                    &input_plan,
                     discarded,
                     current_run.depth as usize,
+                    &invariant_test.fuzz_state,
+                    &invariant_test.targeted_contracts,
+                    Some(&invariant_test.sender_filters),
                 )?);
             }
 
