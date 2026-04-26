@@ -36,6 +36,7 @@ use parking_lot::RwLock;
 use proptest::{strategy::Strategy, test_runner::TestRunner};
 use result::{assert_after_invariant, assert_invariants, can_continue, did_fail_on_assert};
 use revm::{context::Block, state::Account};
+use revm_inspectors::cmp::CmpLog;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -363,6 +364,8 @@ impl<FEN: FoundryEvmNetwork> InvariantTest<FEN> {
 struct InvariantTestRun<FEN: FoundryEvmNetwork> {
     // Invariant run call sequence.
     inputs: Vec<BasicTxDetails>,
+    // Per-executed-call comparison operands.
+    cmp_seq: Vec<Vec<CmpLog>>,
     // Current invariant run executor.
     executor: Executor<FEN>,
     // Invariant run stat reports (eg. gas usage).
@@ -388,6 +391,7 @@ impl<FEN: FoundryEvmNetwork> InvariantTestRun<FEN> {
     fn new(first_input: BasicTxDetails, executor: Executor<FEN>, depth: usize) -> Self {
         Self {
             inputs: vec![first_input],
+            cmp_seq: vec![],
             executor,
             fuzz_runs: Vec::with_capacity(depth),
             created_contracts: vec![],
@@ -518,6 +522,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                 // Execute call from the randomly generated sequence without committing state.
                 // State is committed only if call is not a magic assume.
                 let mut call_result = execute_tx(&mut current_run.executor, tx)?;
+                let cmp_values = call_result.evm_cmp_values.take().unwrap_or_default();
                 let discarded = call_result.result.as_ref() == MAGIC_ASSUME;
                 if self.config.show_metrics {
                     invariant_test.record_metrics(tx, call_result.reverted, discarded);
@@ -650,6 +655,10 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                         }
                     };
 
+                    if current_run.cmp_seq.len() < current_run.inputs.len() {
+                        current_run.cmp_seq.push(cmp_values);
+                    }
+
                     if !result.can_continue || current_run.depth == self.config.depth - 1 {
                         invariant_test.set_last_run_inputs(&current_run.inputs);
                     }
@@ -691,6 +700,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
             });
             corpus_manager.process_inputs(
                 &current_run.inputs,
+                &current_run.cmp_seq,
                 current_run.new_coverage,
                 optimization,
             );

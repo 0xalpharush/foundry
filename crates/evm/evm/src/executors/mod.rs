@@ -42,6 +42,7 @@ use revm::{
     database::{DatabaseCommit, DatabaseRef},
     interpreter::{InstructionResult, return_ok},
 };
+use revm_inspectors::cmp::CmpLog;
 use sancov::SancovGuard;
 use std::{
     borrow::Cow,
@@ -966,6 +967,8 @@ pub struct RawCallResult<FEN: FoundryEvmNetwork = EthEvmNetwork> {
     pub sancov_coverage: Option<Vec<u8>>,
     /// Comparison operands captured via sancov trace-cmp callbacks.
     pub sancov_cmp_values: Option<Vec<foundry_evm_sancov::CmpSample>>,
+    /// EVM comparison operands captured for input-to-state mutation.
+    pub evm_cmp_values: Option<Vec<CmpLog>>,
     /// Scripted transactions generated from this call
     pub transactions: Option<BroadcastableTransactions<FEN::Network>>,
     /// The changeset of the state.
@@ -1000,6 +1003,7 @@ impl<FEN: FoundryEvmNetwork> Default for RawCallResult<FEN> {
             edge_coverage: None,
             sancov_coverage: None,
             sancov_cmp_values: None,
+            evm_cmp_values: None,
             transactions: None,
             state_changeset: HashMap::default(),
             evm_env: EvmEnv::default(),
@@ -1217,6 +1221,7 @@ fn convert_executed_result<FEN: FoundryEvmNetwork>(
         traces,
         line_coverage,
         edge_coverage,
+        evm_cmp_values,
         cheatcodes,
         chisel_state,
         reverter,
@@ -1246,6 +1251,7 @@ fn convert_executed_result<FEN: FoundryEvmNetwork>(
         edge_coverage,
         sancov_coverage: None,
         sancov_cmp_values: None,
+        evm_cmp_values,
         transactions,
         state_changeset,
         evm_env,

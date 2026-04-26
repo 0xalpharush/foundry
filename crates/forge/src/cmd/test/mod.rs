@@ -177,6 +177,10 @@ pub struct TestArgs {
     #[arg(long)]
     pub fuzz_input_file: Option<String>,
 
+    /// Record EVM comparison operands for input-to-state corpus mutation.
+    #[arg(long, hide = true)]
+    pub evm_cmplog: bool,
+
     /// Show test execution progress.
     #[arg(long, conflicts_with_all = ["quiet", "json"], help_heading = "Display options")]
     pub show_progress: bool,
@@ -988,7 +992,16 @@ impl Provider for TestArgs {
         if let Some(fuzz_input_file) = self.fuzz_input_file.clone() {
             fuzz_dict.insert("failure_persist_file".to_string(), fuzz_input_file.into());
         }
+        if self.evm_cmplog {
+            fuzz_dict.insert("evm_cmplog".to_string(), true.into());
+        }
         dict.insert("fuzz".to_string(), fuzz_dict.into());
+
+        if self.evm_cmplog {
+            let mut invariant_dict = Dict::default();
+            invariant_dict.insert("evm_cmplog".to_string(), true.into());
+            dict.insert("invariant".to_string(), invariant_dict.into());
+        }
 
         if let Some(etherscan_api_key) =
             self.etherscan_api_key.as_ref().filter(|s| !s.trim().is_empty())
@@ -1131,6 +1144,12 @@ mod tests {
         let args: TestArgs =
             TestArgs::parse_from(["foundry-cli", "-vvv", "--gas-report", "--fuzz-seed", "0x10"]);
         assert!(args.fuzz_seed.is_some());
+    }
+
+    #[test]
+    fn can_parse_evm_cmplog() {
+        let args: TestArgs = TestArgs::parse_from(["foundry-cli", "--evm-cmplog"]);
+        assert!(args.evm_cmplog);
     }
 
     #[test]

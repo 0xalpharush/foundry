@@ -38,7 +38,10 @@ use revm::{
     primitives::KECCAK_EMPTY,
     state::{Account, AccountStatus},
 };
-use revm_inspectors::edge_cov::EdgeCovInspector;
+use revm_inspectors::{
+    cmp::{CmpLog, CmpLogInspector},
+    edge_cov::EdgeCovInspector,
+};
 use std::{
     ops::{Deref, DerefMut},
     sync::Arc,
@@ -316,6 +319,7 @@ pub struct InspectorData<FEN: FoundryEvmNetwork> {
     pub traces: Option<SparsedTraceArena>,
     pub line_coverage: Option<HitMaps>,
     pub edge_coverage: Option<Vec<u8>>,
+    pub evm_cmp_values: Option<Vec<CmpLog>>,
     pub cheatcodes: Option<Box<Cheatcodes<FEN>>>,
     pub chisel_state: Option<(Vec<U256>, Vec<u8>)>,
     pub reverter: Option<Address>,
@@ -361,6 +365,7 @@ pub struct InspectorStackInner {
     // These are boxed to reduce the size of the struct and slightly improve performance of the
     // `if let Some` checks.
     pub chisel_state: Option<Box<ChiselState>>,
+    pub cmp_log: Option<Box<CmpLogInspector>>,
     pub edge_coverage: Option<Box<EdgeCovInspector>>,
     pub fuzzer: Option<Box<Fuzzer>>,
     pub line_coverage: Option<Box<LineCoverageCollector>>,
@@ -546,6 +551,12 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
         self.edge_coverage = yes.then(EdgeCovInspector::new).map(Into::into);
     }
 
+    /// Set whether to enable the EVM comparison operand collector.
+    #[inline]
+    pub fn collect_evm_cmp(&mut self, yes: bool) {
+        self.inner.cmp_log = yes.then(CmpLogInspector::new).map(Into::into);
+    }
+
     /// Set whether to collect sancov edge coverage from instrumented native crates.
     #[inline]
     pub const fn collect_sancov_edges(&mut self, yes: bool) {
@@ -629,6 +640,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
             inner:
                 InspectorStackInner {
                     chisel_state,
+                    cmp_log,
                     line_coverage,
                     edge_coverage,
                     log_collector,
@@ -669,6 +681,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
             traces,
             line_coverage: line_coverage.map(|line_coverage| line_coverage.finish()),
             edge_coverage: edge_coverage.map(|edge_coverage| edge_coverage.into_hitcount()),
+            evm_cmp_values: cmp_log.map(|cmp_log| cmp_log.into_logs()),
             cheatcodes,
             chisel_state: chisel_state.and_then(|state| state.state),
             reverter,
@@ -961,6 +974,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
         call_inspectors!(
             [
                 // These are sorted in definition order.
+                &mut self.cmp_log,
                 &mut self.edge_coverage,
                 &mut self.fuzzer,
                 &mut self.line_coverage,

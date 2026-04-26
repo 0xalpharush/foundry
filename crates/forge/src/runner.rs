@@ -744,6 +744,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
         executor
             .inspector_mut()
             .collect_sancov_trace_cmp(invariant_config.corpus.collect_sancov_trace_cmp());
+        executor.inspector_mut().collect_evm_cmp(invariant_config.corpus.collect_evm_cmp());
         let mut config = invariant_config.clone();
         let (failure_dir, failure_file) = test_paths(
             &mut config.corpus,
@@ -1066,6 +1067,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
         executor
             .inspector_mut()
             .collect_sancov_trace_cmp(fuzz_config.corpus.collect_sancov_trace_cmp());
+        executor.inspector_mut().collect_evm_cmp(fuzz_config.corpus.collect_evm_cmp());
         // Load persisted counterexample, if any.
         let persisted_failure =
             foundry_common::fs::read_json_file::<BaseCounterExample>(failure_file.as_path()).ok();
