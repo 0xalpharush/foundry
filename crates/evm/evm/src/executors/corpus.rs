@@ -56,6 +56,8 @@ use proptest::{
 use serde::{Deserialize, Serialize};
 use std::{
     fmt,
+    fs::File,
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -69,6 +71,8 @@ const WORKER: &str = "worker";
 const CORPUS_DIR: &str = "corpus";
 const SYNC_DIR: &str = "sync";
 const OPTIMIZATION_BEST_FILE: &str = "optimization_best.json";
+const DIFFERENTIAL_COVERAGE_DIR: &str = "coverage_data";
+const DIFFERENTIAL_COVERAGE_APPROACH: &str = "foundry";
 
 const FAVORABILITY_THRESHOLD: f64 = 0.3;
 const COVERAGE_MAP_SIZE: usize = 65536;
@@ -248,6 +252,66 @@ impl CorpusMetrics {
     }
 }
 
+/// AFL showmap-style coverage data for differential-coverage.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AflShowMap {
+    evm: Vec<u8>,
+}
+
+impl AflShowMap {
+    fn new(evm: Vec<u8>) -> Self {
+        Self { evm }
+    }
+
+    /// Merges coverage maps from another worker by preserving the highest observed hit bucket.
+    pub(crate) fn merge_from(&mut self, other: &Self) {
+        merge_coverage_map(&mut self.evm, &other.evm);
+    }
+
+    /// Writes coverage in the campaign directory format expected by differential-coverage.
+    pub(crate) fn write_to_corpus_dir(&self, corpus_dir: &Path) -> std::io::Result<PathBuf> {
+        let trial_file = format!("showmap-{}.out", Uuid::new_v4());
+        self.write_to_corpus_dir_with_trial(corpus_dir, &trial_file)
+    }
+
+    fn write_to_corpus_dir_with_trial(
+        &self,
+        corpus_dir: &Path,
+        trial_file: &str,
+    ) -> std::io::Result<PathBuf> {
+        let output_dir =
+            corpus_dir.join(DIFFERENTIAL_COVERAGE_DIR).join(DIFFERENTIAL_COVERAGE_APPROACH);
+        std::fs::create_dir_all(&output_dir)?;
+
+        let output_path = output_dir.join(trial_file);
+        let mut writer = BufWriter::new(File::create(&output_path)?);
+        write_showmap_entries(&mut writer, &self.evm)?;
+        writer.flush()?;
+
+        Ok(output_path)
+    }
+}
+
+fn merge_coverage_map(target: &mut Vec<u8>, source: &[u8]) {
+    if target.len() < source.len() {
+        target.resize(source.len(), 0);
+    }
+
+    for (target, source) in target.iter_mut().zip(source) {
+        *target = (*target).max(*source);
+    }
+}
+
+fn write_showmap_entries(writer: &mut impl Write, coverage_map: &[u8]) -> std::io::Result<()> {
+    for (edge_id, hit_count) in coverage_map.iter().enumerate() {
+        if *hit_count > 0 {
+            writeln!(writer, "{edge_id}:{hit_count}")?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Per-worker corpus manager.
 pub struct WorkerCorpus {
     /// Worker Id
@@ -362,7 +426,12 @@ impl WorkerCorpus {
             // Master worker loads the initial corpus, if it exists.
             // Then, [distribute]s it to workers.
             let executor = executor.expect("Executor required for master worker");
-            'corpus_replay: for entry in read_corpus_dir(corpus_dir) {
+            let corpus_entries = if config.afl_show_map {
+                read_initial_corpus_dirs(corpus_dir)
+            } else {
+                read_corpus_dir(corpus_dir).collect()
+            };
+            'corpus_replay: for entry in corpus_entries {
                 let tx_seq = entry.read_tx_seq()?;
                 if tx_seq.is_empty() {
                     continue;
@@ -425,6 +494,11 @@ impl WorkerCorpus {
             optimization_best_value,
             optimization_best_sequence,
         })
+    }
+
+    /// Returns the coverage maps accumulated by this worker in differential-coverage format.
+    pub(crate) fn afl_show_map(&self) -> AflShowMap {
+        AflShowMap::new(self.history_map.clone())
     }
 
     /// Updates stats for the given call sequence, if new coverage produced.
@@ -1170,6 +1244,28 @@ fn read_corpus_dir(path: &Path) -> impl Iterator<Item = CorpusDirEntry> {
     .into_iter()
 }
 
+fn read_initial_corpus_dirs(path: &Path) -> Vec<CorpusDirEntry> {
+    let mut entries = read_corpus_dir(path).collect::<Vec<_>>();
+
+    let Ok(dir) = std::fs::read_dir(path) else {
+        return entries;
+    };
+    for entry in dir.flatten() {
+        let worker_dir = entry.path();
+        if !worker_dir.is_dir() {
+            continue;
+        }
+        let Some(name) = worker_dir.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with(WORKER) {
+            entries.extend(read_corpus_dir(&worker_dir.join(CORPUS_DIR)));
+        }
+    }
+
+    entries
+}
+
 struct CorpusDirEntry {
     path: PathBuf,
     uuid: Uuid,
@@ -1267,6 +1363,27 @@ mod tests {
         };
 
         (manager, seed_uuid)
+    }
+
+    #[test]
+    fn afl_show_map_writes_showmap_under_corpus_dir() {
+        let corpus_dir = temp_corpus_dir();
+        let maps = AflShowMap::new(vec![0, 1, 0, 8]);
+
+        let path = maps.write_to_corpus_dir_with_trial(&corpus_dir, "t1.out").unwrap();
+
+        assert_eq!(path, corpus_dir.join("coverage_data").join("foundry").join("t1.out"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "1:1\n3:8\n");
+    }
+
+    #[test]
+    fn afl_show_map_merges_worker_maps_by_max_hit_count() {
+        let mut aggregate = AflShowMap::new(vec![0, 1, 8]);
+        let worker = AflShowMap::new(vec![4, 1, 2, 16]);
+
+        aggregate.merge_from(&worker);
+
+        assert_eq!(aggregate.evm, vec![4, 1, 8, 16]);
     }
 
     #[test]

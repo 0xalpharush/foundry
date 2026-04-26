@@ -1,7 +1,8 @@
 use crate::{
     executors::{
         DURATION_BETWEEN_METRICS_REPORT, EarlyExit, EvmError, Executor, FuzzTestTimer,
-        RawCallResult, corpus::WorkerCorpus,
+        RawCallResult,
+        corpus::{AflShowMap, WorkerCorpus},
     },
     inspectors::Fuzzer,
 };
@@ -462,6 +463,27 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
         let (mut invariant_test, mut corpus_manager) =
             self.prepare_test(&invariant_contract, fuzz_fixtures, fuzz_state)?;
 
+        if self.config.corpus.afl_show_map {
+            let Some(corpus_dir) = &self.config.corpus.corpus_dir else {
+                return Err(eyre!("afl_show_map requires a configured corpus_dir"));
+            };
+            corpus_manager.afl_show_map().write_to_corpus_dir(corpus_dir)?;
+
+            let result = invariant_test.test_data;
+            return Ok(InvariantFuzzTestResult {
+                error: result.failures.error,
+                cases: result.fuzz_cases,
+                reverts: result.failures.reverts,
+                last_run_inputs: result.last_run_inputs,
+                gas_report_traces: result.gas_report_traces,
+                line_coverage: result.line_coverage,
+                metrics: result.metrics,
+                failed_corpus_replays: corpus_manager.failed_replays,
+                optimization_best_value: result.optimization_best_value,
+                optimization_best_sequence: result.optimization_best_sequence,
+            });
+        }
+
         // Start timer for this invariant test.
         let mut runs = 0;
         let timer = FuzzTestTimer::new(self.config.timeout);
@@ -762,6 +784,16 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
 
         trace!(?fuzz_fixtures);
         invariant_test.fuzz_state.log_stats();
+
+        if self.config.corpus.afl_show_map
+            && let Some(corpus_dir) = &self.config.corpus.corpus_dir
+        {
+            let mut show_map = AflShowMap::default();
+            show_map.merge_from(&corpus_manager.afl_show_map());
+            if let Err(err) = show_map.write_to_corpus_dir(corpus_dir) {
+                debug!(target: "corpus", %err, "failed to write differential coverage data");
+            }
+        }
 
         let result = invariant_test.test_data;
         Ok(InvariantFuzzTestResult {
