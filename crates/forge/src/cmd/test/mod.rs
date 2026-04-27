@@ -186,6 +186,10 @@ pub struct TestArgs {
     #[arg(long)]
     pub rerun: bool,
 
+    /// Replay persisted corpus inputs and write AFL showmap-style EVM edge coverage.
+    #[arg(long, hide = true)]
+    pub afl_show_map: bool,
+
     /// Print test summary table.
     #[arg(long, help_heading = "Display options")]
     pub summary: bool,
@@ -988,7 +992,16 @@ impl Provider for TestArgs {
         if let Some(fuzz_input_file) = self.fuzz_input_file.clone() {
             fuzz_dict.insert("failure_persist_file".to_string(), fuzz_input_file.into());
         }
+        if self.afl_show_map {
+            fuzz_dict.insert("afl_show_map".to_string(), true.into());
+        }
         dict.insert("fuzz".to_string(), fuzz_dict.into());
+
+        if self.afl_show_map {
+            let mut invariant_dict = Dict::default();
+            invariant_dict.insert("afl_show_map".to_string(), true.into());
+            dict.insert("invariant".to_string(), invariant_dict.into());
+        }
 
         if let Some(etherscan_api_key) =
             self.etherscan_api_key.as_ref().filter(|s| !s.trim().is_empty())
@@ -1117,6 +1130,12 @@ mod tests {
     fn fuzz_seed() {
         let args: TestArgs = TestArgs::parse_from(["foundry-cli", "--fuzz-seed", "0x10"]);
         assert!(args.fuzz_seed.is_some());
+    }
+
+    #[test]
+    fn can_parse_afl_show_map_flag() {
+        let args: TestArgs = TestArgs::parse_from(["foundry-cli", "--afl-show-map"]);
+        assert!(args.afl_show_map);
     }
 
     #[test]

@@ -1,11 +1,11 @@
 use crate::executors::{
     DURATION_BETWEEN_METRICS_REPORT, EarlyExit, Executor, FuzzTestTimer, RawCallResult,
-    corpus::{GlobalCorpusMetrics, WorkerCorpus},
+    corpus::{AflShowMap, GlobalCorpusMetrics, WorkerCorpus},
 };
 use alloy_dyn_abi::JsonAbiExt;
 use alloy_json_abi::Function;
 use alloy_primitives::{Address, Bytes, Log, U256, keccak256, map::HashMap};
-use eyre::Result;
+use eyre::{Result, eyre};
 use foundry_common::sh_println;
 use foundry_config::FuzzConfig;
 use foundry_evm_core::{
@@ -77,6 +77,8 @@ struct WorkerState<FEN: FoundryEvmNetwork> {
     last_run_timestamp: u128,
     /// Failed corpus replays
     failed_corpus_replays: usize,
+    /// Edge coverage accumulated by this worker for differential coverage reports.
+    afl_show_map: AflShowMap,
 }
 
 impl<FEN: FoundryEvmNetwork> WorkerState<FEN> {
@@ -95,6 +97,7 @@ impl<FEN: FoundryEvmNetwork> WorkerState<FEN> {
             failure: None,
             last_run_timestamp: 0,
             failed_corpus_replays: 0,
+            afl_show_map: AflShowMap::default(),
         }
     }
 }
@@ -219,6 +222,10 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
         early_exit: &EarlyExit,
         tokio_handle: &tokio::runtime::Handle,
     ) -> Result<FuzzTestResult> {
+        if self.config.corpus.afl_show_map {
+            return self.replay_corpus_to_afl_show_map(func, fuzz_fixtures, state);
+        }
+
         let shared_state = SharedFuzzState::new(state, self.config.timeout, early_exit.clone());
 
         debug!(n = self.num_workers, "spawning workers");
@@ -243,6 +250,45 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             .collect::<Result<Vec<_>>>()?;
 
         Ok(self.aggregate_results(workers, func, &shared_state))
+    }
+
+    fn replay_corpus_to_afl_show_map(
+        &self,
+        func: &Function,
+        fuzz_fixtures: &FuzzFixtures,
+        state: EvmFuzzState,
+    ) -> Result<FuzzTestResult> {
+        let Some(corpus_dir) = &self.config.corpus.corpus_dir else {
+            return Err(eyre!("afl_show_map requires a configured corpus_dir"));
+        };
+
+        let dictionary_weight = self.config.dictionary.dictionary_weight.min(100);
+        let strategy = proptest::prop_oneof![
+            100 - dictionary_weight => fuzz_calldata(func.clone(), fuzz_fixtures),
+            dictionary_weight => fuzz_calldata_from_state(func.clone(), &state),
+        ]
+        .prop_map(|calldata| BasicTxDetails {
+            warp: None,
+            roll: None,
+            sender: Default::default(),
+            call_details: CallDetails { target: Default::default(), calldata },
+        });
+
+        let corpus = WorkerCorpus::new(
+            0,
+            self.config.corpus.clone(),
+            strategy.boxed(),
+            Some(&self.executor_f),
+            Some(func),
+            None,
+        )?;
+        corpus.afl_show_map().write_to_corpus_dir(corpus_dir)?;
+
+        Ok(FuzzTestResult {
+            success: true,
+            failed_corpus_replays: corpus.failed_replays,
+            ..Default::default()
+        })
     }
 
     /// Granular and single-step function that runs only one fuzz and returns either a `CaseOutcome`
@@ -383,6 +429,18 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
 
         if !self.config.show_logs {
             result.logs = workers[last_run_worker_idx].logs.clone();
+        }
+
+        if self.config.corpus.afl_show_map
+            && let Some(corpus_dir) = &self.config.corpus.corpus_dir
+        {
+            let mut show_map = AflShowMap::default();
+            for worker in &workers {
+                show_map.merge_from(&worker.afl_show_map);
+            }
+            if let Err(err) = show_map.write_to_corpus_dir(corpus_dir) {
+                debug!(target: "corpus", %err, "failed to write differential coverage data");
+            }
         }
 
         for mut worker in workers {
@@ -645,6 +703,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
         if worker_id == 0 {
             worker.failed_corpus_replays = corpus.failed_replays;
         }
+        worker.afl_show_map = corpus.afl_show_map();
 
         // Logs stats
         trace!("worker {worker_id} fuzz stats");

@@ -129,6 +129,8 @@ pub struct FuzzCorpusConfig {
     /// Whether to capture comparison operands from sancov-instrumented crates
     /// and inject them into the fuzz dictionary. Independent of `sancov_edges`.
     pub sancov_trace_cmp: bool,
+    /// Whether to replay the persisted corpus and write AFL showmap-style EVM edge coverage.
+    pub afl_show_map: bool,
 }
 
 impl FuzzCorpusConfig {
@@ -140,7 +142,10 @@ impl FuzzCorpusConfig {
 
     /// Whether any edge coverage (EVM or sancov) should be collected.
     pub const fn collect_edge_coverage(&self) -> bool {
-        self.corpus_dir.is_some() || self.show_edge_coverage || self.sancov_edges
+        self.corpus_dir.is_some()
+            || self.show_edge_coverage
+            || self.sancov_edges
+            || self.afl_show_map
     }
 
     /// Whether the EVM `EdgeCovInspector` should be enabled.
@@ -150,7 +155,8 @@ impl FuzzCorpusConfig {
     /// Trace-cmp-only mode keeps EVM edges enabled since trace-cmp only
     /// contributes dictionary entries, not edge coverage.
     pub const fn collect_evm_edge_coverage(&self) -> bool {
-        !self.sancov_edges && (self.corpus_dir.is_some() || self.show_edge_coverage)
+        !self.sancov_edges
+            && (self.corpus_dir.is_some() || self.show_edge_coverage || self.afl_show_map)
     }
 
     /// Whether sancov edge coverage collection is enabled.
@@ -184,6 +190,7 @@ impl Default for FuzzCorpusConfig {
             show_edge_coverage: false,
             sancov_edges: false,
             sancov_trace_cmp: false,
+            afl_show_map: false,
         }
     }
 }

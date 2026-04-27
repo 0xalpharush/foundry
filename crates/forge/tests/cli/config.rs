@@ -198,6 +198,7 @@ corpus_min_size = 0
 show_edge_coverage = false
 sancov_edges = false
 sancov_trace_cmp = false
+afl_show_map = false
 failure_persist_dir = "cache/fuzz"
 show_logs = false
 
@@ -221,6 +222,7 @@ corpus_min_size = 0
 show_edge_coverage = false
 sancov_edges = false
 sancov_trace_cmp = false
+afl_show_map = false
 failure_persist_dir = "cache/invariant"
 show_metrics = true
 show_solidity = false
@@ -1287,6 +1289,7 @@ forgetest_init!(test_default_config, |prj, cmd| {
     "show_edge_coverage": false,
     "sancov_edges": false,
     "sancov_trace_cmp": false,
+    "afl_show_map": false,
     "failure_persist_dir": "cache/fuzz",
     "show_logs": false,
     "timeout": null
@@ -1312,6 +1315,7 @@ forgetest_init!(test_default_config, |prj, cmd| {
     "show_edge_coverage": false,
     "sancov_edges": false,
     "sancov_trace_cmp": false,
+    "afl_show_map": false,
     "failure_persist_dir": "cache/invariant",
     "show_metrics": true,
     "timeout": null,
