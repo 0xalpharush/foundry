@@ -988,7 +988,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
         // Creates the invariant strategy.
         let strategy = invariant_strat(
             fuzz_state.clone(),
-            targeted_senders,
+            targeted_senders.clone(),
             targeted_contracts.clone(),
             self.config.clone(),
             fuzz_fixtures.clone(),
@@ -1071,7 +1071,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
             }
         }
 
-        let worker = WorkerCorpus::new(
+        let mut worker = WorkerCorpus::new(
             0,
             self.config.corpus.clone(),
             strategy.boxed(),
@@ -1080,6 +1080,18 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
             Some(&targeted_contracts),
             Some(self.dynamic_target_ctx()),
         )?;
+
+        // Seed the corpus from sibling unit tests so the mutator starts from
+        // developer-chosen call sequences (e.g. clamped values, sequencing in
+        // the harness) instead of purely random inputs.
+        if let Err(err) = worker.seed_from_test_traces(
+            invariant_contract,
+            &targeted_contracts,
+            &targeted_senders,
+            &self.executor,
+        ) {
+            debug!(target: "corpus", %err, "failed to seed corpus from test traces");
+        }
 
         let mut invariant_test =
             InvariantTest::new(fuzz_state, targeted_contracts, failures, self.runner.clone());
