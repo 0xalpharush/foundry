@@ -9699,6 +9699,7 @@ dependencies = [
 [[package]]
 name = "revm-inspectors"
 version = "0.39.0"
+source = "git+https://github.com/0xalpharush/revm-inspectors.git?branch=evm-cmplog-inspector#cd7f8adf0d0cd8373418e507fb5b3e7f4d379549"
 dependencies = [
  "alloy-primitives",
  "alloy-rpc-types-eth",

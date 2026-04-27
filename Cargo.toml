@@ -538,7 +538,7 @@ snapbox = { version = "0.6", features = ["json", "regex", "term-svg"] }
 idna_adapter = "=1.1.0"
 
 [patch.crates-io]
-revm-inspectors = { path = "../revm-inspectors-cmplog" }
+revm-inspectors = { git = "https://github.com/0xalpharush/revm-inspectors.git", branch = "evm-cmplog-inspector" }
 
 # https://github.com/rust-cli/rexpect/pull/106
 rexpect = { git = "https://github.com/rust-cli/rexpect", rev = "2ed0b1898d7edaf6a85bedbae71a01cc578958fc" }
