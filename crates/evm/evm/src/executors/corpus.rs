@@ -92,6 +92,10 @@ enum MutationType {
     Suffix,
     /// ABI mutate random args of selected call in sequence.
     Abi,
+    /// Insert a tx loaded from an on-disk corpus entry into the original sequence.
+    CrossoverInsert,
+    /// Replace a tx in the original sequence with one loaded from an on-disk corpus entry.
+    CrossoverReplace,
 }
 
 /// Persisted optimization state: the best value found and the sequence that produced it.
@@ -303,6 +307,8 @@ impl WorkerCorpus {
             Just(MutationType::Prefix),
             Just(MutationType::Suffix),
             Just(MutationType::Abi),
+            Just(MutationType::CrossoverInsert),
+            Just(MutationType::CrossoverReplace),
         ]
         .boxed();
 
@@ -684,6 +690,36 @@ impl WorkerCorpus {
                         }
                     }
                 }
+                MutationType::CrossoverInsert => {
+                    let corpus = if rng.random::<bool>() { primary } else { secondary };
+                    let base_uuid = corpus.uuid;
+                    new_seq = corpus.tx_seq.clone();
+                    let idx = rng.random_range(0..=new_seq.len());
+
+                    self.current_mutated = Some(base_uuid);
+
+                    if let Some(disk_tx) = self.load_random_disk_tx(test_runner) {
+                        trace!(target: "corpus", "crossover insert on-disk tx into {}", base_uuid);
+                        new_seq.insert(idx, disk_tx);
+                    } else {
+                        trace!(target: "corpus", "no on-disk corpus available for crossover insert, leaving {} unchanged", base_uuid);
+                    }
+                }
+                MutationType::CrossoverReplace => {
+                    let corpus = if rng.random::<bool>() { primary } else { secondary };
+                    let base_uuid = corpus.uuid;
+                    new_seq = corpus.tx_seq.clone();
+                    let idx = rng.random_range(0..new_seq.len());
+
+                    self.current_mutated = Some(base_uuid);
+
+                    if let Some(disk_tx) = self.load_random_disk_tx(test_runner) {
+                        trace!(target: "corpus", "crossover replace tx in {}", base_uuid);
+                        new_seq[idx] = disk_tx;
+                    } else {
+                        trace!(target: "corpus", "no on-disk corpus available for crossover replace, leaving {} unchanged", base_uuid);
+                    }
+                }
             }
         }
 
@@ -790,6 +826,32 @@ impl WorkerCorpus {
             });
         }
         Ok(())
+    }
+
+    /// Loads a random tx from a random on-disk corpus entry of this worker.
+    /// Returns `None` if the corpus directory is unavailable, empty, or the picked
+    /// entry could not be read.
+    fn load_random_disk_tx(&self, test_runner: &mut TestRunner) -> Option<BasicTxDetails> {
+        let worker_dir = self.worker_dir.as_ref()?;
+        let corpus_dir = worker_dir.join(CORPUS_DIR);
+        let entries: Vec<CorpusDirEntry> = read_corpus_dir(&corpus_dir).collect();
+        if entries.is_empty() {
+            return None;
+        }
+        let entry_idx = test_runner.rng().random_range(0..entries.len());
+        let entry = &entries[entry_idx];
+        let tx_seq = match entry.read_tx_seq() {
+            Ok(seq) => seq,
+            Err(err) => {
+                debug!(target: "corpus", %err, "failed to load on-disk corpus entry {:?}", entry.path);
+                return None;
+            }
+        };
+        if tx_seq.is_empty() {
+            return None;
+        }
+        let tx_idx = test_runner.rng().random_range(0..tx_seq.len());
+        tx_seq.into_iter().nth(tx_idx)
     }
 
     /// Mutates calldata of provided tx by abi decoding current values and randomly selecting the
