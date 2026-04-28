@@ -622,7 +622,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                 if new_call_coverage {
                     corpus_manager.hoist_observed_calls(
                         &observed,
-                        tx,
+                        current_run.inputs.last().expect("checked above"),
                         &invariant_test.targeted_contracts,
                     );
                 }

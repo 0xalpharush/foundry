@@ -1,5 +1,5 @@
 use crate::invariant::RandomCallGenerator;
-use alloy_primitives::{Address, B256, Bytes, map::AddressMap};
+use alloy_primitives::{Address, B256, Bytes, U256, map::AddressMap};
 use foundry_common::mapping_slots::{MappingSlots, step as mapping_step};
 use foundry_evm_core::constants::CHEATCODE_ADDRESS;
 use revm::{
@@ -18,6 +18,7 @@ pub struct ObservedCall {
     pub depth: u32,
     pub target: Address,
     pub calldata: Bytes,
+    pub value: Option<U256>,
 }
 
 /// An inspector that can fuzz and collect data for that effect.
@@ -68,14 +69,12 @@ impl<CTX: ContextTr> Inspector<CTX> for Fuzzer {
         // `inputs` may have been rewritten by `override_call` above — record the
         // post-override target/calldata since that's what actually executes.
         if self.record_calls && self.call_depth > 1 {
-            let calldata = inputs.input.bytes(ecx);
-            if calldata.len() >= 4 {
-                self.observed_calls.push(ObservedCall {
-                    depth: self.call_depth - 1,
-                    target: inputs.target_address,
-                    calldata,
-                });
-            }
+            self.observed_calls.push(ObservedCall {
+                depth: self.call_depth - 1,
+                target: inputs.target_address,
+                calldata: inputs.input.bytes(ecx),
+                value: inputs.transfer_value().filter(|value| !value.is_zero()),
+            });
         }
 
         // We only collect `stack` and `memory` data before and after calls.
