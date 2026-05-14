@@ -5,6 +5,7 @@ use crate::{
     },
     inspectors::Fuzzer,
 };
+use abi_fuzz::Runner;
 use alloy_json_abi::Function;
 use alloy_primitives::{Address, Bytes, FixedBytes, I256, Selector, U256, map::AddressMap};
 use alloy_sol_types::{SolCall, sol};
@@ -34,7 +35,6 @@ use foundry_evm_fuzz::{
 use foundry_evm_traces::{CallTraceArena, SparsedTraceArena};
 use indicatif::ProgressBar;
 use parking_lot::RwLock;
-use proptest::{strategy::Strategy, test_runner::TestRunner};
 use result::{assert_after_invariant, can_continue, did_fail_on_assert, invariant_preflight_check};
 use revm::{context::Block, state::Account};
 use serde::{Deserialize, Serialize};
@@ -47,7 +47,7 @@ use std::{
 
 mod error;
 pub use error::{
-    FailureKey, HandlerAssertionFailure, InvariantFailures, InvariantFuzzError,
+    FailureKey, HandlerAssertionFailure, InvariantFailures, InvariantFuzzError, TestFailure,
     handler_site_already_minimal,
 };
 use foundry_evm_coverage::HitMaps;
@@ -270,7 +270,7 @@ struct InvariantTestData {
     // The strategy only comes with the first `input`. We fill the rest of the `inputs`
     // until the desired `depth` so we can use the evolving fuzz dictionary
     // during the run.
-    branch_runner: TestRunner,
+    branch_runner: Runner,
 
     // Optimization mode state: tracks the best (maximum) value and the sequence that produced it.
     // Only used when invariant function returns int256.
@@ -284,6 +284,9 @@ struct InvariantTest {
     fuzz_state: InvariantFuzzState,
     // Contracts fuzzed by the invariant test.
     targeted_contracts: FuzzRunIdentifiedContracts,
+    // Sender filters: consulted once at the run-loop boundary to remap any
+    // generated/mutated tx whose sender is excluded onto `FALLBACK_SENDER`.
+    sender_filters: SenderFilters,
     // Data collected during invariant runs.
     test_data: InvariantTestData,
 }
@@ -293,8 +296,9 @@ impl InvariantTest {
     fn new(
         fuzz_state: InvariantFuzzState,
         targeted_contracts: FuzzRunIdentifiedContracts,
+        sender_filters: SenderFilters,
         failures: InvariantFailures,
-        branch_runner: TestRunner,
+        branch_runner: Runner,
     ) -> Self {
         let test_data = InvariantTestData {
             fuzz_cases: vec![],
@@ -307,7 +311,7 @@ impl InvariantTest {
             optimization_best_value: None,
             optimization_best_sequence: vec![],
         };
-        Self { fuzz_state, targeted_contracts, test_data }
+        Self { fuzz_state, targeted_contracts, sender_filters, test_data }
     }
 
     /// Returns number of invariant test reverts.
@@ -417,13 +421,13 @@ impl<FEN: FoundryEvmNetwork> InvariantTestRun<FEN> {
 /// Wrapper around any [`Executor`] implementer which provides fuzzing support using [`proptest`].
 ///
 /// After instantiation, calling `invariant_fuzz` will proceed to hammer the deployed smart
-/// contracts with inputs, until it finds a counterexample sequence. The provided [`TestRunner`]
+/// contracts with inputs, until it finds a counterexample sequence. The provided [`Runner`]
 /// contains all the configuration which can be overridden via [environment
 /// variables](proptest::test_runner::Config)
 pub struct InvariantExecutor<'a, FEN: FoundryEvmNetwork> {
     pub executor: Executor<FEN>,
     /// Proptest runner.
-    runner: TestRunner,
+    runner: Runner,
     /// The invariant configuration
     config: InvariantConfig,
     /// Contracts deployed with `setUp()`
@@ -439,7 +443,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
     /// Instantiates a fuzzed executor EVM given a testrunner
     pub fn new(
         executor: Executor<FEN>,
-        runner: TestRunner,
+        runner: Runner,
         config: InvariantConfig,
         setup_contracts: &'a ContractsByAddress,
         project_contracts: &'a ContractsByArtifact,
@@ -509,11 +513,16 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
             // Per-run failure count snapshot used to gate `afterInvariant` below.
             let failures_before_run = invariant_test.test_data.failures.invariant_count();
 
-            let initial_seq = corpus_manager.new_inputs(
+            let mut initial_seq = corpus_manager.new_inputs(
                 &mut invariant_test.test_data.branch_runner,
                 &invariant_test.fuzz_state,
                 &invariant_test.targeted_contracts,
             )?;
+            // Single fixup point: remap any excluded sender to FALLBACK_SENDER
+            // before the tx enters the run sequence.
+            for tx in &mut initial_seq {
+                tx.sender = invariant_test.sender_filters.resolve(tx.sender);
+            }
 
             // Create current invariant run data.
             let mut current_run = InvariantTestRun::new(
@@ -772,12 +781,14 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                     current_run.depth += 1;
                 }
 
-                current_run.inputs.push(corpus_manager.generate_next_input(
+                let mut next = corpus_manager.generate_next_input(
                     &mut invariant_test.test_data.branch_runner,
                     &initial_seq,
                     discarded,
                     current_run.depth as usize,
-                )?);
+                )?;
+                next.sender = invariant_test.sender_filters.resolve(next.sender);
+                current_run.inputs.push(next);
             }
 
             // Extend corpus with current run data.
@@ -948,19 +959,18 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
     ) -> Result<(InvariantTest, WorkerCorpus)> {
         // Finds out the chosen deployed contracts and/or senders.
         self.select_contract_artifacts(invariant_contract.address)?;
-        let (targeted_senders, targeted_contracts) =
+        let (sender_filters, targeted_contracts) =
             self.select_contracts_and_senders(invariant_contract.address)?;
         let fuzz_state = fuzz_state.into_invariant();
 
-        // Creates the invariant strategy.
+        // Creates the invariant generator (yields one tx per call).
         let strategy = invariant_strat(
             fuzz_state.clone(),
-            targeted_senders,
+            sender_filters.clone(),
             targeted_contracts.clone(),
             self.config.clone(),
             fuzz_fixtures.clone(),
-        )
-        .no_shrink();
+        );
 
         // If any of the targeted contracts have the storage layout enabled then we can sample
         // mapping values. To accomplish, we need to record the mapping storage slots and keys.
@@ -1050,14 +1060,19 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
         let worker = WorkerCorpus::new(
             0,
             self.config.corpus.clone(),
-            strategy.boxed(),
+            strategy,
             Some(&self.executor),
             None,
             Some(&targeted_contracts),
         )?;
 
-        let mut invariant_test =
-            InvariantTest::new(fuzz_state, targeted_contracts, failures, self.runner.clone());
+        let mut invariant_test = InvariantTest::new(
+            fuzz_state,
+            targeted_contracts,
+            sender_filters,
+            failures,
+            self.runner.clone(),
+        );
 
         // Seed invariant test with previously persisted optimization state,
         // but only if the current invariant is in optimization mode.
@@ -1472,10 +1487,18 @@ pub(crate) fn call_invariant_function<FEN: FoundryEvmNetwork>(
 
 /// Executes a fuzz call and returns the result.
 /// Applies any block timestamp (warp) and block number (roll) adjustments before the call.
+///
+/// Excluded-sender fixup is **not** done here — it happens once at the run-loop
+/// boundary (`SenderFilters::resolve` applied before pushing onto
+/// `current_run.inputs`), so by the time a tx reaches `execute_tx` its sender
+/// is already valid. Generation and mutation strategies are therefore free of
+/// excluded-sender filtering.
 pub(crate) fn execute_tx<FEN: FoundryEvmNetwork>(
     executor: &mut Executor<FEN>,
     tx: &BasicTxDetails,
 ) -> Result<RawCallResult<FEN>> {
+    let sender = tx.sender;
+
     let warp = tx.warp.unwrap_or_default();
     let roll = tx.roll.unwrap_or_default();
 
@@ -1502,14 +1525,37 @@ pub(crate) fn execute_tx<FEN: FoundryEvmNetwork>(
         }
     }
 
-    // Bound requested value by sender's available balance so payable paths still get
-    // exercised when the requested value exceeds balance, instead of collapsing to zero.
     let requested_value = tx.call_details.value.unwrap_or(U256::ZERO);
-    let sender_balance = executor.get_balance(tx.sender)?;
-    let value = requested_value.min(sender_balance);
-    executor
-        .call_raw(tx.sender, tx.call_details.target, tx.call_details.calldata.clone(), value)
-        .map_err(|e| eyre!(format!("Could not make raw evm call: {e}")))
+    let value = if requested_value.is_zero() {
+        U256::ZERO
+    } else {
+        if let Some(deal) = tx.deal {
+            let current_balance = executor.get_balance(sender)?;
+            executor.set_balance(sender, current_balance + deal)?;
+        }
+
+        let sender_balance = executor.get_balance(sender)?;
+        if requested_value <= sender_balance {
+            requested_value
+        } else if sender_balance > U256::ZERO {
+            requested_value % sender_balance
+        } else {
+            U256::ZERO
+        }
+    };
+
+    let mut call_result = executor
+        .call_raw(sender, tx.call_details.target, tx.call_details.calldata.clone(), value)
+        .map_err(|e| eyre!(format!("Could not make raw evm call: {e}")))?;
+
+    // Propagate block adjustments to call result which will be committed.
+    if warp > 0 || roll > 0 {
+        let ts = call_result.evm_env.block_env.timestamp();
+        let num = call_result.evm_env.block_env.number();
+        call_result.evm_env.block_env.set_timestamp(ts + warp);
+        call_result.evm_env.block_env.set_number(num + roll);
+    }
+    Ok(call_result)
 }
 
 #[cfg(test)]

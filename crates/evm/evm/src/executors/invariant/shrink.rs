@@ -9,13 +9,13 @@ use crate::executors::{
 };
 use alloy_json_abi::Function;
 use alloy_primitives::{Address, B256, Bytes, I256, Selector, U256};
+use fixedbitset::FixedBitSet;
 use foundry_config::InvariantConfig;
 use foundry_evm_core::{
     FoundryBlock, constants::MAGIC_ASSUME, decode::RevertDecoder, evm::FoundryEvmNetwork,
 };
 use foundry_evm_fuzz::{BasicTxDetails, invariant::InvariantContract};
 use indicatif::ProgressBar;
-use proptest::bits::{BitSetLike, VarBitSet};
 use revm::context::Block;
 
 /// Shrinker for a call sequence failure.
@@ -27,17 +27,19 @@ struct CallSequenceShrinker {
     /// Length of call sequence to be shrunk.
     call_sequence_len: usize,
     /// Call ids contained in current shrunk sequence.
-    included_calls: VarBitSet,
+    included_calls: FixedBitSet,
 }
 
 impl CallSequenceShrinker {
     fn new(call_sequence_len: usize) -> Self {
-        Self { call_sequence_len, included_calls: VarBitSet::saturated(call_sequence_len) }
+        let mut included_calls = FixedBitSet::with_capacity(call_sequence_len);
+        included_calls.set_range(0..call_sequence_len, true);
+        Self { call_sequence_len, included_calls }
     }
 
     /// Return candidate shrink sequence to be tested, by removing ids from original sequence.
     fn current(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..self.call_sequence_len).filter(|&call_id| self.included_calls.test(call_id))
+        (0..self.call_sequence_len).filter(|&call_id| self.included_calls.contains(call_id))
     }
 
     /// Advance to the next call index, wrapping around to 0 at the end.
@@ -163,7 +165,7 @@ fn build_shrunk_sequence(
         accumulated_warp += call.warp.unwrap_or(U256::ZERO);
         accumulated_roll += call.roll.unwrap_or(U256::ZERO);
 
-        if shrinker.included_calls.test(idx) {
+        if shrinker.included_calls.contains(idx) {
             result.push(apply_warp_roll(call, accumulated_warp, accumulated_roll));
             accumulated_warp = U256::ZERO;
             accumulated_roll = U256::ZERO;
@@ -195,23 +197,23 @@ where
         }
 
         // Already-removed indices have nothing to drop.
-        if !shrinker.included_calls.test(call_idx) {
+        if !shrinker.included_calls.contains(call_idx) {
             call_idx = shrinker.next_index(call_idx);
             continue;
         }
 
-        shrinker.included_calls.clear(call_idx);
+        shrinker.included_calls.remove(call_idx);
 
         let bug_still_present = match predicate(&shrinker) {
             Ok(b) => b,
             Err(_) => matches!(error_policy, ShrinkErrorPolicy::KeepRemoved),
         };
         if bug_still_present {
-            if shrinker.included_calls.count() == 1 {
+            if shrinker.included_calls.count_ones(..) == 1 {
                 break;
             }
         } else {
-            shrinker.included_calls.set(call_idx);
+            shrinker.included_calls.insert(call_idx);
         }
 
         if let Some(progress) = progress {
@@ -498,7 +500,7 @@ pub(crate) fn shrink_sequence_value<FEN: FoundryEvmNetwork>(
             break;
         }
 
-        shrinker.included_calls.clear(call_idx);
+        shrinker.included_calls.remove(call_idx);
 
         let keeps_target = check_sequence_value(
             executor.clone(),
@@ -509,11 +511,11 @@ pub(crate) fn shrink_sequence_value<FEN: FoundryEvmNetwork>(
         )? == Some(target_value);
 
         if keeps_target {
-            if shrinker.included_calls.count() == 1 {
+            if shrinker.included_calls.count_ones(..) == 1 {
                 break;
             }
         } else {
-            shrinker.included_calls.set(call_idx);
+            shrinker.included_calls.insert(call_idx);
         }
 
         if let Some(progress) = progress {
@@ -702,12 +704,12 @@ mod tests {
     use super::{CallSequenceShrinker, build_shrunk_sequence};
     use alloy_primitives::{Address, Bytes, U256};
     use foundry_evm_fuzz::{BasicTxDetails, CallDetails};
-    use proptest::bits::BitSetLike;
 
     fn tx(warp: Option<u64>, roll: Option<u64>) -> BasicTxDetails {
         BasicTxDetails {
             warp: warp.map(U256::from),
             roll: roll.map(U256::from),
+            deal: None,
             sender: Address::ZERO,
             call_details: CallDetails {
                 target: Address::ZERO,
@@ -721,7 +723,7 @@ mod tests {
     fn build_shrunk_sequence_accumulates_removed_delay_into_next_kept_call() {
         let calls = vec![tx(Some(3), Some(5)), tx(Some(7), Some(11)), tx(Some(13), Some(17))];
         let mut shrinker = CallSequenceShrinker::new(calls.len());
-        shrinker.included_calls.clear(0);
+        shrinker.included_calls.remove(0);
 
         let shrunk = build_shrunk_sequence(&calls, &shrinker, true);
 
@@ -736,7 +738,7 @@ mod tests {
     fn build_shrunk_sequence_does_not_move_trailing_delay_backward() {
         let calls = vec![tx(Some(3), Some(5)), tx(Some(7), Some(11))];
         let mut shrinker = CallSequenceShrinker::new(calls.len());
-        shrinker.included_calls.clear(1);
+        shrinker.included_calls.remove(1);
 
         let shrunk = build_shrunk_sequence(&calls, &shrinker, true);
 

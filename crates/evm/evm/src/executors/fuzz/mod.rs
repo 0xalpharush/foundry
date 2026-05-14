@@ -2,6 +2,7 @@ use crate::executors::{
     DURATION_BETWEEN_METRICS_REPORT, EarlyExit, Executor, FuzzTestTimer, RawCallResult,
     corpus::{GlobalCorpusMetrics, WorkerCorpus},
 };
+use abi_fuzz::Runner;
 use alloy_dyn_abi::JsonAbiExt;
 use alloy_json_abi::Function;
 use alloy_primitives::{Address, Bytes, Log, U256, keccak256, map::HashMap};
@@ -16,16 +17,13 @@ use foundry_evm_core::{
 };
 use foundry_evm_coverage::HitMaps;
 use foundry_evm_fuzz::{
-    BaseCounterExample, BasicTxDetails, CallDetails, CounterExample, FuzzCase, FuzzError,
-    FuzzFixtures, FuzzRunMetadata, FuzzTestResult,
+    BaseCounterExample, BasicTxDetails, CallDetails, CounterExample, FuzzCase, FuzzFixtures,
+    FuzzRunMetadata, FuzzTestResult,
     strategies::{EvmFuzzState, fuzz_calldata, fuzz_calldata_from_state},
 };
 use foundry_evm_traces::SparsedTraceArena;
 use indicatif::ProgressBar;
-use proptest::{
-    strategy::Strategy,
-    test_runner::{RngAlgorithm, TestCaseError, TestRng, TestRunner},
-};
+use rand::RngCore;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde_json::json;
 use std::{
@@ -70,7 +68,7 @@ struct WorkerState<FEN: FoundryEvmNetwork> {
     /// Number of runs this worker completed
     runs: u32,
     /// Failure reason if this worker failed
-    failure: Option<TestCaseError>,
+    failure: Option<String>,
     /// Fuzz run metadata that produced the failure.
     failure_run: Option<FuzzRunMetadata>,
     /// Last run timestamp in milliseconds
@@ -113,8 +111,6 @@ struct SharedFuzzState {
     ///
     /// This ID is then used to correctly extract the failure reason and counterexample.
     failed_worker_id: OnceLock<usize>,
-    /// Total rejects across workers
-    total_rejects: Arc<AtomicU32>,
     /// Fuzz timer
     timer: FuzzTestTimer,
     /// Global corpus metrics
@@ -132,7 +128,6 @@ impl SharedFuzzState {
             state,
             total_runs: Arc::new(AtomicU32::new(0)),
             failed_worker_id: OnceLock::new(),
-            total_rejects: Arc::new(AtomicU32::new(0)),
             timer: FuzzTestTimer::new(timeout),
             global_corpus_metrics: GlobalCorpusMetrics::default(),
             global_early_exit: early_exit,
@@ -143,11 +138,6 @@ impl SharedFuzzState {
     /// Increments the number of runs and returns the new value.
     fn increment_runs(&self) -> u32 {
         self.total_runs.fetch_add(1, Ordering::Relaxed) + 1
-    }
-
-    /// Increments and returns the new value of the number of rejected tests.
-    fn increment_rejects(&self) -> u32 {
-        self.total_rejects.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Returns `true` if the worker should continue running.
@@ -170,16 +160,15 @@ impl SharedFuzzState {
     }
 }
 
-/// Wrapper around an [`Executor`] which provides fuzzing support using [`proptest`].
+/// Wrapper around an [`Executor`] which provides fuzzing support using [`abi_fuzz`].
 ///
 /// After instantiation, calling `fuzz` will proceed to hammer the deployed smart contract with
-/// inputs, until it finds a counterexample. The provided [`TestRunner`] contains all the
-/// configuration which can be overridden via [environment variables](proptest::test_runner::Config)
+/// inputs, until it finds a counterexample.
 pub struct FuzzedExecutor<FEN: FoundryEvmNetwork> {
     /// The EVM executor.
     executor_f: Executor<FEN>,
     /// The fuzzer
-    runner: TestRunner,
+    _runner: Runner,
     /// The account that calls tests.
     sender: Address,
     /// The fuzz configuration.
@@ -194,7 +183,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
     /// Instantiates a fuzzed executor given a testrunner
     pub fn new(
         executor: Executor<FEN>,
-        runner: TestRunner,
+        runner: Runner,
         sender: Address,
         config: FuzzConfig,
         persisted_failure: Option<BaseCounterExample>,
@@ -208,7 +197,14 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             Ord::max(1, run_limit / MIN_RUNS_PER_WORKER)
         };
         let num_workers = Ord::min(rayon::current_num_threads(), max_workers as usize);
-        Self { executor_f: executor, runner, sender, config, persisted_failure, num_workers }
+        Self {
+            executor_f: executor,
+            _runner: runner,
+            sender,
+            config,
+            persisted_failure,
+            num_workers,
+        }
     }
 
     /// Fuzzes the provided function, assuming it is available at the contract at `address`
@@ -263,15 +259,16 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
         address: Address,
         calldata: Bytes,
         coverage_metrics: &mut WorkerCorpus,
-    ) -> Result<FuzzOutcome<FEN>, TestCaseError> {
+    ) -> Result<Option<FuzzOutcome<FEN>>, String> {
         let mut call = executor
             .call_raw(self.sender, address, calldata.clone(), U256::ZERO)
-            .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            .map_err(|e| e.to_string())?;
         let new_coverage = coverage_metrics.merge_edge_coverage(&mut call);
         coverage_metrics.process_inputs(
             &[BasicTxDetails {
                 warp: None,
                 roll: None,
+                deal: None,
                 sender: self.sender,
                 call_details: CallDetails {
                     target: address,
@@ -283,9 +280,9 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             None,
         );
 
-        // Handle `vm.assume`.
+        // Handle `vm.assume`: silently retry (do not count as a run).
         if call.result.as_ref() == MAGIC_ASSUME {
-            return Err(TestCaseError::reject(FuzzError::AssumeReject));
+            return Ok(None);
         }
 
         let (breakpoints, deprecated_cheatcodes) =
@@ -306,20 +303,20 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
         };
 
         if success {
-            Ok(FuzzOutcome::Case(CaseOutcome {
+            Ok(Some(FuzzOutcome::Case(CaseOutcome {
                 case: FuzzCase { gas: call.gas_used, stipend: call.stipend },
                 traces: call.traces,
                 coverage: call.line_coverage,
                 breakpoints,
                 logs: call.logs,
                 deprecated_cheatcodes,
-            }))
+            })))
         } else {
-            Ok(FuzzOutcome::CounterExample(CounterExampleOutcome {
+            Ok(Some(FuzzOutcome::CounterExample(CounterExampleOutcome {
                 exit_reason: call.exit_reason,
                 counterexample: (calldata, call),
                 breakpoints,
-            }))
+            })))
         }
     }
 
@@ -370,8 +367,8 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             result.breakpoints = call.cheatcodes.map(|c| c.breakpoints);
 
             match &failed_worker.failure {
-                Some(TestCaseError::Fail(reason)) => {
-                    let reason = reason.to_string();
+                Some(reason) => {
+                    let reason = reason.clone();
                     result.reason = (!reason.is_empty()).then_some(reason);
                     let args = if let Some(data) = calldata.get(4..) {
                         func.abi_decode_input(data).unwrap_or_default()
@@ -387,10 +384,6 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                                 fuzz.worker,
                             )),
                     ));
-                }
-                Some(TestCaseError::Reject(reason)) => {
-                    let reason = reason.to_string();
-                    result.reason = (!reason.is_empty()).then_some(reason);
                 }
                 None => {}
             }
@@ -438,23 +431,28 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
         progress: Option<&ProgressBar>,
     ) -> Result<WorkerState<FEN>> {
         // Prepare
-        let fuzz_state = shared_state.state.fork();
         let dictionary_weight = self.config.dictionary.dictionary_weight.min(100);
-        let strategy = proptest::prop_oneof![
-            100 - dictionary_weight => fuzz_calldata(func.clone(), fuzz_fixtures),
-            dictionary_weight => fuzz_calldata_from_state(func.clone(), &fuzz_state),
-        ]
-        .prop_map(move |calldata| BasicTxDetails {
-            warp: None,
-            roll: None,
-            sender: Default::default(),
-            call_details: CallDetails { target: Default::default(), calldata, value: None },
-        });
+        let mut a = fuzz_calldata(func.clone(), fuzz_fixtures);
+        let mut b = fuzz_calldata_from_state(func.clone(), &shared_state.state);
+        let dict_w = dictionary_weight;
+        let total_w: u32 = 100;
+        let strategy: Box<dyn FnMut(&mut dyn RngCore) -> BasicTxDetails> =
+            Box::new(move |rng: &mut dyn RngCore| {
+                let calldata =
+                    if rand::Rng::random_ratio(rng, dict_w, total_w) { b(rng) } else { a(rng) };
+                BasicTxDetails {
+                    warp: None,
+                    roll: None,
+                    deal: None,
+                    sender: Default::default(),
+                    call_details: CallDetails { target: Default::default(), calldata, value: None },
+                }
+            });
 
         let mut corpus = WorkerCorpus::new(
             worker_id,
             self.config.corpus.clone(),
-            strategy.boxed(),
+            strategy,
             // Master worker replays the persisted corpus using the executor
             (worker_id == 0).then_some(&self.executor_f),
             Some(func),
@@ -470,25 +468,21 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
         let worker_runs = self.runs_per_worker(worker_id);
         debug!(worker_runs);
 
-        let mut runner_config = self.runner.config().clone();
-        runner_config.cases = worker_runs;
-
         let mut runner = if let Some(seed) = self.config.seed {
             let worker_seed = Self::fuzz_worker_seed(seed, worker_id);
             trace!(target: "forge::test", ?worker_seed, "deterministic seed for worker {worker_id}");
-            let rng = TestRng::from_seed(RngAlgorithm::ChaCha, &worker_seed.to_be_bytes::<32>());
-            TestRunner::new_with_rng(runner_config, rng)
+            Runner::seeded(worker_seed.to_be_bytes::<32>())
         } else {
-            TestRunner::new(runner_config)
+            Runner::random()
         };
 
         if let Some(target_run) = self.config.run {
             for _ in 1..target_run {
-                if let Err(err) = corpus.new_input(&mut runner, &fuzz_state, func) {
-                    worker.failure = Some(TestCaseError::fail(format!(
+                if let Err(err) = corpus.new_input(&mut runner, &shared_state.state, func) {
+                    worker.failure = Some(format!(
                         "failed to generate fuzzed input in worker {}: {err}",
                         worker.id
-                    )));
+                    ));
                     shared_state.try_claim_failure(worker_id);
                     return Ok(worker);
                 }
@@ -552,13 +546,13 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                     cheats.set_seed(Self::fuzz_run_seed(seed, worker_id, fuzz_run));
                 }
 
-                let input = match corpus.new_input(&mut runner, &fuzz_state, func) {
+                let input = match corpus.new_input(&mut runner, &shared_state.state, func) {
                     Ok(input) => input,
                     Err(err) => {
-                        worker.failure = Some(TestCaseError::fail(format!(
+                        worker.failure = Some(format!(
                             "failed to generate fuzzed input in worker {}: {err}",
                             worker.id
-                        )));
+                        ));
                         shared_state.try_claim_failure(worker_id);
                         break 'stop;
                     }
@@ -591,7 +585,9 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
 
             worker.last_run_timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
             match self.single_fuzz(&executor, address, input, &mut corpus) {
-                Ok(fuzz_outcome) => match fuzz_outcome {
+                // `vm.assume(false)` rejected this input — silently retry.
+                Ok(None) => continue 'stop,
+                Ok(Some(fuzz_outcome)) => match fuzz_outcome {
                     FuzzOutcome::Case(case) => {
                         let total_runs = inc_runs();
 
@@ -662,38 +658,16 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                         };
                         worker.logs.extend(outcome.1.logs.clone());
                         worker.counterexample = outcome;
-                        worker.failure = Some(TestCaseError::fail(reason.unwrap_or_default()));
+                        worker.failure = Some(reason.unwrap_or_default());
                         shared_state.try_claim_failure(worker_id);
                         break 'stop;
                     }
                 },
-                Err(err) => match err {
-                    TestCaseError::Fail(_) => {
-                        worker.failure = Some(err);
-                        shared_state.try_claim_failure(worker_id);
-                        break 'stop;
-                    }
-                    TestCaseError::Reject(_) => {
-                        let max = self.config.max_test_rejects;
-
-                        let total = shared_state.increment_rejects();
-
-                        // Update progress bar to reflect rejected runs.
-                        // TODO(dani): (pre-existing) conflicts with corpus metrics `set_message`
-                        if !self.config.corpus.collect_edge_coverage()
-                            && let Some(progress) = progress
-                        {
-                            progress.set_message(format!("([{total}] rejected)"));
-                        }
-
-                        if max > 0 && total > max {
-                            worker.failure =
-                                Some(TestCaseError::reject(FuzzError::TooManyRejects(max)));
-                            shared_state.try_claim_failure(worker_id);
-                            break 'stop;
-                        }
-                    }
-                },
+                Err(err) => {
+                    worker.failure = Some(err);
+                    shared_state.try_claim_failure(worker_id);
+                    break 'stop;
+                }
             }
         }
 
@@ -703,7 +677,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
 
         // Logs stats
         trace!("worker {worker_id} fuzz stats");
-        fuzz_state.log_stats();
+        shared_state.state.log_stats();
 
         Ok(worker)
     }

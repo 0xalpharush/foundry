@@ -34,7 +34,7 @@ foundry-linking.workspace = true
 
 comfy-table.workspace = true
 eyre.workspace = true
-proptest.workspace = true
+abi-fuzz.workspace = true
 rand.workspace = true
 rayon.workspace = true
 serde.workspace = true

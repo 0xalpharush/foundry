@@ -1,8 +1,13 @@
 use alloy_json_abi::{Function, JsonAbi};
-use alloy_primitives::{Address, Selector};
+use alloy_primitives::{Address, Selector, address};
 use foundry_compilers::ArtifactId;
 use foundry_evm_core::utils::get_function;
 use std::collections::BTreeMap;
+
+/// Default fallback sender used when an excluded address slips through random
+/// generation or mutation. Picked deterministically (`0x30000`) so test runs
+/// remain reproducible.
+pub const FALLBACK_SENDER: Address = address!("0x0000000000000000000000000000000000030000");
 
 /// Contains which contracts are to be targeted or excluded on an invariant test through their
 /// artifact identifiers.
@@ -55,7 +60,7 @@ impl ArtifactFilters {
 /// clashing.
 ///
 /// `address(0)` is excluded by default.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SenderFilters {
     pub targeted: Vec<Address>,
     pub excluded: Vec<Address>,
@@ -69,5 +74,13 @@ impl SenderFilters {
         }
         targeted.retain(|addr| !excluded.contains(addr));
         Self { targeted, excluded }
+    }
+
+    /// Returns `sender` unchanged when it is allowed, or [`FALLBACK_SENDER`]
+    /// when it is in the excluded list. Used as the single fixup point right
+    /// before tx execution, so generation and mutation strategies don't need
+    /// to filter excluded addresses themselves.
+    pub fn resolve(&self, sender: Address) -> Address {
+        if self.excluded.contains(&sender) { FALLBACK_SENDER } else { sender }
     }
 }

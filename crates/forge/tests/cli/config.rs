@@ -183,7 +183,6 @@ ignore = []
 [fuzz]
 runs = 256
 fail_on_revert = true
-max_test_rejects = 65536
 dictionary_weight = 40
 include_storage = true
 include_push_bytes = true
@@ -292,7 +291,6 @@ forgetest!(can_extract_config_values, |prj, cmd| {
         show_progress: false,
         fuzz: FuzzConfig {
             runs: 1000,
-            max_test_rejects: 100203,
             seed: Some(U256::from(1000)),
             failure_persist_dir: Some("test-cache/fuzz".into()),
             show_logs: false,
@@ -1299,7 +1297,6 @@ forgetest_init!(test_default_config, |prj, cmd| {
     "run": null,
     "worker": null,
     "fail_on_revert": true,
-    "max_test_rejects": 65536,
     "seed": null,
     "dictionary_weight": 40,
     "include_storage": true,
@@ -1346,6 +1343,7 @@ forgetest_init!(test_default_config, |prj, cmd| {
     "show_solidity": false,
     "max_time_delay": null,
     "max_block_delay": null,
+    "max_deal": null,
     "check_interval": 1,
     "assert_all": true
   },

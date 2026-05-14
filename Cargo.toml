@@ -218,7 +218,6 @@ sha3.opt-level = 3
 keccak.opt-level = 3
 
 # Fuzzing.
-proptest.opt-level = 3
 foundry-evm-fuzz.opt-level = 3
 rand.opt-level = 3
 rand_chacha.opt-level = 3
@@ -468,7 +467,7 @@ mesc = "0.3"
 memchr = "2.7"
 num-format = "0.4"
 parking_lot = "0.12"
-proptest = "1.9.0"
+abi-fuzz = { path = "/Users/alpharush/dev/abi-fuzz" }
 rand = "0.9"
 rand_08 = { package = "rand", version = "0.8" }
 ratatui = { version = "0.30", default-features = false }

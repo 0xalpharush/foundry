@@ -5,17 +5,15 @@ use crate::{
 use alloy_dyn_abi::JsonAbiExt;
 use alloy_json_abi::Function;
 use alloy_primitives::Bytes;
-use proptest::prelude::Strategy;
+use rand::RngCore;
 
-/// Given a function, it returns a strategy which generates valid calldata
+/// Closure-style "strategy": yields a fresh calldata blob per call.
+pub type CalldataStrategy = Box<dyn FnMut(&mut dyn RngCore) -> Bytes>;
+
+/// Given a function, it returns a generator which produces valid calldata
 /// for that function's input types, following declared test fixtures.
-pub fn fuzz_calldata(
-    func: Function,
-    fuzz_fixtures: &FuzzFixtures,
-) -> impl Strategy<Value = Bytes> + use<> {
-    // We need to compose all the strategies generated for each parameter in all
-    // possible combinations, accounting any parameter declared fixture
-    let strats = func
+pub fn fuzz_calldata(func: Function, fuzz_fixtures: &FuzzFixtures) -> CalldataStrategy {
+    let mut strats = func
         .inputs
         .iter()
         .map(|input| {
@@ -26,7 +24,8 @@ pub fn fuzz_calldata(
             )
         })
         .collect::<Vec<_>>();
-    strats.prop_map(move |values| {
+    Box::new(move |rng| {
+        let values: Vec<_> = strats.iter_mut().map(|s| s(rng)).collect();
         func.abi_encode_input(&values)
             .unwrap_or_else(|_| {
                 panic!(
@@ -38,38 +37,34 @@ pub fn fuzz_calldata(
     })
 }
 
-/// Given a function and some state, it returns a strategy which generated valid calldata for the
+/// Given a function and some state, it returns a generator which produces valid calldata for the
 /// given function's input types, based on state taken from the EVM.
-pub fn fuzz_calldata_from_state<S: FuzzStateReader>(
-    func: Function,
-    state: &S,
-) -> impl Strategy<Value = Bytes> + use<S> {
-    let strats = func
+pub fn fuzz_calldata_from_state<S: FuzzStateReader>(func: Function, state: &S) -> CalldataStrategy {
+    let mut strats = func
         .inputs
         .iter()
         .map(|input| fuzz_param_from_state(&input.selector_type().parse().unwrap(), state))
         .collect::<Vec<_>>();
-    strats
-        .prop_map(move |values| {
-            func.abi_encode_input(&values)
-                .unwrap_or_else(|_| {
-                    panic!(
-                        "Fuzzer generated invalid arguments for function `{}` with inputs {:?}: {:?}",
-                        func.name, func.inputs, values
-                    )
-                })
-                .into()
-        })
-        .no_shrink()
+    Box::new(move |rng| {
+        let values: Vec<_> = strats.iter_mut().map(|s| s(rng)).collect();
+        func.abi_encode_input(&values)
+            .unwrap_or_else(|_| {
+                panic!(
+                    "Fuzzer generated invalid arguments for function `{}` with inputs {:?}: {:?}",
+                    func.name, func.inputs, values
+                )
+            })
+            .into()
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{FuzzFixtures, strategies::fuzz_calldata};
+    use abi_fuzz::Runner;
     use alloy_dyn_abi::{DynSolValue, JsonAbiExt};
     use alloy_json_abi::Function;
     use alloy_primitives::{Address, map::HashMap};
-    use proptest::prelude::Strategy;
 
     #[test]
     fn can_fuzz_with_fixtures() {
@@ -77,15 +72,18 @@ mod tests {
 
         let address_fixture = DynSolValue::Address(Address::random());
         let mut fixtures = HashMap::default();
+        // FuzzFixtures lowercases the lookup key (see `normalize_fixture`),
+        // so the inserted key must already be lowercase.
         fixtures.insert(
-            "addressFixture".to_string(),
+            "addressfixture".to_string(),
             DynSolValue::Array(vec![address_fixture.clone()]),
         );
 
         let expected = function.abi_encode_input(&[address_fixture]).unwrap();
-        let strategy = fuzz_calldata(function, &FuzzFixtures::new(fixtures));
-        let _ = strategy.prop_map(move |fuzzed| {
-            assert_eq!(expected, fuzzed);
-        });
+        let mut strategy = fuzz_calldata(function, &FuzzFixtures::new(fixtures));
+        let mut runner = Runner::seeded([0u8; 32]);
+        // The fixture is picked ~50% of the time; sampling many times must hit it.
+        let saw_fixture = (0..256).any(|_| strategy(runner.rng()) == expected);
+        assert!(saw_fixture, "fixture was never selected from the configured pool");
     }
 }

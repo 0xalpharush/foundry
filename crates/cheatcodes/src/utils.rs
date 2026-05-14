@@ -1,7 +1,8 @@
 //! Implementations of [`Utilities`](spec::Group::Utilities) cheatcodes.
 
 use crate::{Cheatcode, Cheatcodes, CheatcodesExecutor, CheatsCtxt, Result, Vm::*};
-use alloy_dyn_abi::{DynSolType, DynSolValue, Resolver, TypedData, eip712_parser::EncodeType};
+use abi_fuzz::generators::sampler::{sample_address, sample_int, sample_uint};
+use alloy_dyn_abi::{DynSolValue, Resolver, TypedData, eip712_parser::EncodeType};
 use alloy_ens::namehash;
 use alloy_primitives::{B64, Bytes, I256, U256, aliases::B32, keccak256, map::HashMap};
 use alloy_rlp::{Decodable, Encodable};
@@ -9,8 +10,6 @@ use alloy_sol_types::SolValue;
 use foundry_common::{TYPE_BINDING_PREFIX, fs};
 use foundry_config::fs_permissions::FsAccessKind;
 use foundry_evm_core::{constants::DEFAULT_CREATE2_DEPLOYER, evm::FoundryEvmNetwork};
-use foundry_evm_fuzz::strategies::BoundMutator;
-use proptest::prelude::Strategy;
 use rand::{Rng, RngCore, seq::SliceRandom};
 use revm::{
     context::{ContextTr, JournalTr},
@@ -82,7 +81,7 @@ impl Cheatcode for ensNamehashCall {
 impl Cheatcode for bound_0Call {
     fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
         let Self { current, min, max } = *self;
-        let Some(mutated) = U256::bound(current, min, max, state.test_runner()) else {
+        let Some(mutated) = bound_uint(current, min, max, state.test_runner().rng()) else {
             bail!("cannot bound {current} in [{min}, {max}] range")
         };
         Ok(mutated.abi_encode())
@@ -92,10 +91,68 @@ impl Cheatcode for bound_0Call {
 impl Cheatcode for bound_1Call {
     fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
         let Self { current, min, max } = *self;
-        let Some(mutated) = I256::bound(current, min, max, state.test_runner()) else {
+        let Some(mutated) = bound_int(current, min, max, state.test_runner().rng()) else {
             bail!("cannot bound {current} in [{min}, {max}] range")
         };
         Ok(mutated.abi_encode())
+    }
+}
+
+/// Sample a uniform `U256` in `[min, max]` (inclusive).
+///
+/// Caller must ensure `min <= max`. Uses random-bit-width sampling so the
+/// resulting distribution covers the full magnitude range of the target
+/// interval rather than biasing toward `U256::MAX`-scale values.
+fn sample_uint_in_range(min: U256, max: U256, rng: &mut dyn RngCore) -> U256 {
+    let bits = rng.random_range(8..=256);
+    let mask = (U256::ONE << bits) - U256::ONE;
+    let candidate = U256::from(rng.random::<u128>()) & mask;
+    min + (candidate % ((max - min).saturating_add(U256::ONE)))
+}
+
+/// Sample a `U256` in `[min, max]` that is **not equal to** `current`.
+///
+/// Returns `None` when no valid mutation exists (`min > max`, `current` outside
+/// the range, or the singleton range `min == max`).
+fn bound_uint(current: U256, min: U256, max: U256, rng: &mut dyn RngCore) -> Option<U256> {
+    if min > max || current < min || current > max || min == max {
+        return None;
+    }
+    loop {
+        let candidate = sample_uint_in_range(min, max, rng);
+        if candidate != current {
+            return Some(candidate);
+        }
+    }
+}
+
+/// Signed sibling of [`bound_uint`].
+fn bound_int(current: I256, min: I256, max: I256, rng: &mut dyn RngCore) -> Option<I256> {
+    if min > max || current < min || current > max || min == max {
+        return None;
+    }
+    loop {
+        let bits = rng.random_range(8..=255);
+        let mask = (U256::ONE << bits) - U256::ONE;
+        let rand_u = U256::from(rng.next_u64()) | (U256::from(rng.next_u64()) << 64);
+        let unsigned_candidate = rand_u & mask;
+
+        let signed_candidate = {
+            let midpoint = U256::ONE << (bits - 1);
+            if unsigned_candidate < midpoint {
+                I256::from_raw(unsigned_candidate)
+            } else {
+                I256::from_raw(unsigned_candidate) - I256::from_raw(U256::ONE << bits)
+            }
+        };
+
+        let range = max.saturating_sub(min).saturating_add(I256::ONE).unsigned_abs();
+        let wrapped = I256::from_raw(U256::from(signed_candidate.unsigned_abs()) % range);
+        let candidate = if signed_candidate.is_negative() { max - wrapped } else { min + wrapped };
+
+        if candidate != current {
+            return Some(candidate);
+        }
     }
 }
 
@@ -121,11 +178,7 @@ impl Cheatcode for randomUint_2Call {
 
 impl Cheatcode for randomAddressCall {
     fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
-        Ok(DynSolValue::type_strategy(&DynSolType::Address)
-            .new_tree(state.test_runner())
-            .unwrap()
-            .current()
-            .abi_encode())
+        Ok(DynSolValue::Address(sample_address(state.test_runner().rng())).abi_encode())
     }
 }
 
@@ -316,43 +369,25 @@ fn random_uint<FEN: FoundryEvmNetwork>(
     if let Some(bits) = bits {
         // Generate random with specified bits.
         ensure!(bits <= U256::from(256), "number of bits cannot exceed 256");
-        return Ok(DynSolValue::type_strategy(&DynSolType::Uint(bits.to::<usize>()))
-            .new_tree(state.test_runner())
-            .unwrap()
-            .current()
-            .abi_encode());
+        let n = bits.to::<usize>();
+        return Ok(DynSolValue::Uint(sample_uint(n, state.test_runner().rng()), n).abi_encode());
     }
 
     if let Some((min, max)) = bounds {
         ensure!(min <= max, "min must be less than or equal to max");
-        // Generate random between range min..=max
-        let exclusive_modulo = max - min;
-        let mut random_number: U256 = state.rng().random();
-        if exclusive_modulo != U256::MAX {
-            let inclusive_modulo = exclusive_modulo + U256::from(1);
-            random_number %= inclusive_modulo;
-        }
-        random_number += min;
-        return Ok(random_number.abi_encode());
+        return Ok(sample_uint_in_range(min, max, state.test_runner().rng()).abi_encode());
     }
 
     // Generate random `uint256` value.
-    Ok(DynSolValue::type_strategy(&DynSolType::Uint(256))
-        .new_tree(state.test_runner())
-        .unwrap()
-        .current()
-        .abi_encode())
+    Ok(DynSolValue::Uint(sample_uint(256, state.test_runner().rng()), 256).abi_encode())
 }
 
 /// Helper to generate a random `int` value (with given bits if specified) from type strategy.
 fn random_int<FEN: FoundryEvmNetwork>(state: &mut Cheatcodes<FEN>, bits: Option<U256>) -> Result {
     let no_bits = bits.unwrap_or(U256::from(256));
     ensure!(no_bits <= U256::from(256), "number of bits cannot exceed 256");
-    Ok(DynSolValue::type_strategy(&DynSolType::Int(no_bits.to::<usize>()))
-        .new_tree(state.test_runner())
-        .unwrap()
-        .current()
-        .abi_encode())
+    let n = no_bits.to::<usize>();
+    Ok(DynSolValue::Int(sample_int(n, state.test_runner().rng()), n).abi_encode())
 }
 
 impl Cheatcode for eip712HashType_0Call {
@@ -519,5 +554,57 @@ impl Cheatcode for fromRlpCall {
             .map_err(|e| fmt_err!("Failed to decode RLP: {e}"))?;
 
         Ok(decoded.abi_encode())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bound_int, bound_uint};
+    use alloy_primitives::{I256, U256};
+    use rand::{SeedableRng, rngs::StdRng};
+
+    #[test]
+    fn bound_uint_stays_in_range_and_changes_value() {
+        let mut rng = StdRng::seed_from_u64(0);
+        let (min, max, current) = (U256::ZERO, U256::from(200u64), U256::from(100u64));
+        for _ in 0..50 {
+            let mutated = bound_uint(current, min, max, &mut rng).expect("mutation");
+            assert!(mutated >= min);
+            assert!(mutated <= max);
+            assert_ne!(mutated, current);
+        }
+        assert!(bound_uint(current, U256::MIN, U256::MAX, &mut rng).is_some());
+    }
+
+    #[test]
+    fn bound_int_stays_in_range_and_changes_value() {
+        let mut rng = StdRng::seed_from_u64(0);
+        let (min, max, current) = (
+            I256::from_dec_str("-100").unwrap(),
+            I256::from_dec_str("100").unwrap(),
+            I256::from_dec_str("10").unwrap(),
+        );
+        for _ in 0..50 {
+            let mutated = bound_int(current, min, max, &mut rng).expect("mutation");
+            assert!(mutated >= min);
+            assert!(mutated <= max);
+            assert_ne!(mutated, current);
+        }
+        assert!(bound_int(current, I256::MIN, I256::MAX, &mut rng).is_some());
+    }
+
+    #[test]
+    fn bound_returns_none_on_invalid_inputs() {
+        let mut rng = StdRng::seed_from_u64(0);
+        // min > max
+        assert!(
+            bound_uint(U256::from(5u64), U256::from(10u64), U256::from(0u64), &mut rng).is_none()
+        );
+        // current outside range
+        assert!(
+            bound_uint(U256::from(50u64), U256::from(0u64), U256::from(10u64), &mut rng).is_none()
+        );
+        // singleton range
+        assert!(bound_uint(U256::ONE, U256::ONE, U256::ONE, &mut rng).is_none());
     }
 }

@@ -51,8 +51,10 @@ tempo-precompiles.workspace = true
 tempo-primitives.workspace = true
 
 eyre.workspace = true
+fixedbitset = "0.5"
 parking_lot.workspace = true
-proptest.workspace = true
+abi-fuzz.workspace = true
+rand.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 indicatif.workspace = true

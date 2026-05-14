@@ -1,18 +1,32 @@
-use super::{fuzz_calldata, fuzz_msg_value, fuzz_param_from_state};
+use super::{
+    calldata::CalldataStrategy,
+    fuzz_calldata, fuzz_msg_value, fuzz_param, fuzz_param_from_state,
+    param::{MsgValueStrategy, ParamStrategy},
+};
 use crate::{
     BasicTxDetails, CallDetails, FuzzFixtures,
     invariant::{FuzzRunIdentifiedContracts, SenderFilters},
-    strategies::{
-        EvmFuzzState, FuzzStateReader, InvariantFuzzState, fuzz_calldata_from_state, fuzz_param,
-    },
+    strategies::{EvmFuzzState, FuzzStateReader, InvariantFuzzState, fuzz_calldata_from_state},
 };
+use abi_fuzz::generators::sampler::sample_uint;
 use alloy_json_abi::Function;
 use alloy_primitives::{Address, U256};
 use foundry_config::InvariantConfig;
 use parking_lot::RwLock;
-use proptest::prelude::*;
-use rand::seq::IteratorRandom;
+use rand::{Rng, RngCore};
 use std::{rc::Rc, sync::Arc};
+
+/// Closure-style "strategy" yielding a [`CallDetails`] per call.
+pub type CallDetailsStrategy = Box<dyn FnMut(&mut dyn RngCore) -> CallDetails>;
+
+/// Closure-style "strategy" yielding a [`CallDetails`] per call from shared call override state.
+pub type SharedCallDetailsStrategy = Box<dyn FnMut(&mut dyn RngCore) -> CallDetails + Send + Sync>;
+
+/// Closure-style "strategy" yielding a [`BasicTxDetails`] per call.
+pub type TxDetailsStrategy = Box<dyn FnMut(&mut dyn RngCore) -> BasicTxDetails>;
+
+/// Closure-style "strategy" yielding an `Address` per call.
+pub type SenderStrategy = Box<dyn FnMut(&mut dyn RngCore) -> Address>;
 
 /// Given a target address, we generate random calldata.
 pub fn override_call_strat(
@@ -20,52 +34,32 @@ pub fn override_call_strat(
     contracts: Vec<(Address, Vec<Function>)>,
     target: Arc<RwLock<Address>>,
     fuzz_fixtures: FuzzFixtures,
-) -> impl Strategy<Value = CallDetails> + Send + Sync + 'static {
+) -> SharedCallDetailsStrategy {
     let contracts = Arc::new(contracts);
-    let contracts_ref = contracts.clone();
-    proptest::prop_oneof![
-        80 => proptest::strategy::LazyJust::new(move || *target.read()),
-        20 => any::<prop::sample::Selector>()
-            .prop_map(move |selector| {
-                let (target, _) = selector.select(contracts_ref.iter());
-                *target
-            }),
-    ]
-    .prop_flat_map(move |target_address| {
-        let fuzz_state = fuzz_state.clone();
-        let fuzz_fixtures = fuzz_fixtures.clone();
-        let contracts = contracts.clone();
+    Box::new(move |rng: &mut dyn RngCore| {
+        // 80/20: original target vs. random targeted contract.
+        let target_address = if rng.random_ratio(80, 100) {
+            *target.read()
+        } else {
+            contracts[rng.random_range(0..contracts.len())].0
+        };
 
         let (actual_target, func) = {
-            // If the target address is in the contracts map, use it directly.
-            // Otherwise, fall back to a random contract from the targeted contracts.
-            // This can happen when call_override sets target_reference to a contract
-            // that is not in targetContracts (e.g., the protocol contract during reentrancy).
             let (actual_target, fuzzed_functions) = contracts
                 .iter()
                 .find(|(address, _)| *address == target_address)
-                .map(|(address, functions)| (*address, functions.clone()))
-                .unwrap_or_else(|| {
-                    let (address, functions) = contracts
-                        .iter()
-                        .choose(&mut rand::rng())
-                        .expect("at least one target contract");
-                    (*address, functions.clone())
-                });
-            (
-                actual_target,
-                any::<prop::sample::Index>()
-                    .prop_map(move |index| index.get(&fuzzed_functions).clone()),
-            )
+                .unwrap_or_else(|| &contracts[rng.random_range(0..contracts.len())]);
+            let func = fuzzed_functions[rng.random_range(0..fuzzed_functions.len())].clone();
+            (*actual_target, func)
         };
 
-        func.prop_flat_map(move |func| {
-            fuzz_contract_with_calldata(&fuzz_state, &fuzz_fixtures, actual_target, func)
-        })
+        let mut inner =
+            fuzz_contract_with_calldata(&fuzz_state, &fuzz_fixtures, actual_target, func);
+        inner(rng)
     })
 }
 
-/// Creates the invariant strategy.
+/// Creates the invariant generator.
 ///
 /// Given the known and future contracts, it generates the next call by fuzzing the `caller`,
 /// `calldata` and `target`. The generated data is evaluated lazily for every single call to fully
@@ -81,100 +75,93 @@ pub fn invariant_strat(
     contracts: FuzzRunIdentifiedContracts,
     config: InvariantConfig,
     fuzz_fixtures: FuzzFixtures,
-) -> impl Strategy<Value = BasicTxDetails> {
+) -> TxDetailsStrategy {
     let senders = Rc::new(senders);
     let dictionary_weight = config.dictionary.dictionary_weight;
+    let max_time_delay = config.max_time_delay;
+    let max_block_delay = config.max_block_delay;
+    let max_deal = config.max_deal;
 
-    // Strategy to generate values for tx warp and roll.
-    let warp_roll_strat = |cond: bool| {
-        if cond { any::<U256>().prop_map(Some).boxed() } else { Just(None).boxed() }
-    };
-
-    any::<prop::sample::Selector>()
-        .prop_flat_map(move |selector| {
+    Box::new(move |rng: &mut dyn RngCore| {
+        // Pick a random (target_address, target_function) pair.
+        let (target_address, target_function) = {
             let contracts = contracts.targets();
-            let functions = contracts.fuzzed_functions();
-            let (target_address, target_function) = selector.select(functions);
+            let functions = contracts.fuzzed_functions().collect::<Vec<_>>();
+            let pick = functions[rng.random_range(0..functions.len())];
+            (*pick.0, pick.1.clone())
+        };
 
-            let sender = select_random_sender(&fuzz_state, senders.clone(), dictionary_weight);
+        // TODO cycle b/w [0x10000, 0x20000, defaultDeployerAddr]?
+        let mut sender_strat =
+            select_random_sender(&fuzz_state, senders.clone(), dictionary_weight);
+        let sender = sender_strat(rng);
 
-            let call_details = fuzz_contract_with_calldata(
-                &fuzz_state,
-                &fuzz_fixtures,
-                *target_address,
-                target_function.clone(),
-            );
+        let mut call_details_strat = fuzz_contract_with_calldata(
+            &fuzz_state,
+            &fuzz_fixtures,
+            target_address,
+            target_function,
+        );
+        let call_details = call_details_strat(rng);
 
-            let warp = warp_roll_strat(config.max_time_delay.is_some());
-            let roll = warp_roll_strat(config.max_block_delay.is_some());
+        let warp = max_time_delay.map(|m| sample_uint(256, rng) % U256::from(m));
+        let roll = max_block_delay.map(|m| sample_uint(256, rng) % U256::from(m));
+        let deal = max_deal.map(|m| sample_uint(256, rng) % U256::from(m));
 
-            (warp, roll, sender, call_details)
-        })
-        .prop_map(move |(warp, roll, sender, call_details)| {
-            let warp =
-                warp.map(|time| time % U256::from(config.max_time_delay.unwrap_or_default()));
-            let roll =
-                roll.map(|block| block % U256::from(config.max_block_delay.unwrap_or_default()));
-            BasicTxDetails { warp, roll, sender, call_details }
-        })
+        BasicTxDetails { warp, roll, deal, sender, call_details }
+    })
 }
 
 /// Strategy to select a sender address:
-/// * If `senders` is empty, then it's either a random address (10%) or from the dictionary (90%).
-/// * If `senders` is not empty, a random address is chosen from the list of senders.
+/// * If `senders` is empty, draw an address either uniformly random (`100 - dictionary_weight`%) or
+///   from the EVM fuzz dictionary (`dictionary_weight`%).
+/// * If `senders` is not empty, pick uniformly from the targeted list.
+///
+/// Excluded-sender fixup happens once at the run-loop boundary
+/// ([`SenderFilters::resolve`] applied before pushing onto `current_run.inputs`),
+/// so this strategy is free to return any address.
 fn select_random_sender<S: FuzzStateReader>(
     fuzz_state: &S,
     senders: Rc<SenderFilters>,
     dictionary_weight: u32,
-) -> impl Strategy<Value = Address> + use<S> {
+) -> SenderStrategy {
     if senders.targeted.is_empty() {
         assert!(dictionary_weight <= 100, "dictionary_weight must be <= 100");
-        proptest::prop_oneof![
-            100 - dictionary_weight => fuzz_param(&alloy_dyn_abi::DynSolType::Address),
-            dictionary_weight => fuzz_param_from_state(&alloy_dyn_abi::DynSolType::Address, fuzz_state),
-        ]
-        .prop_map(move |addr| {
-            let mut addr = addr.as_address().unwrap();
-            // Make sure the selected address is not in the list of excluded senders.
-            // We don't use proptest's filter to avoid reaching the `PROPTEST_MAX_LOCAL_REJECTS`
-            // max rejects and exiting test before all runs completes.
-            // See <https://github.com/foundry-rs/foundry/issues/11369>.
-            loop {
-                if !senders.excluded.contains(&addr) {
-                    break;
-                }
-                addr = Address::random();
-            }
-            addr
+        let total = 100u32;
+        let dict_w = dictionary_weight;
+        let mut random_strat: ParamStrategy = fuzz_param(&alloy_dyn_abi::DynSolType::Address);
+        let mut state_strat: ParamStrategy =
+            fuzz_param_from_state(&alloy_dyn_abi::DynSolType::Address, fuzz_state);
+        Box::new(move |rng: &mut dyn RngCore| {
+            let value =
+                if rng.random_ratio(dict_w, total) { state_strat(rng) } else { random_strat(rng) };
+            value.as_address().unwrap()
         })
-        .boxed()
     } else {
-        any::<prop::sample::Index>().prop_map(move |index| *index.get(&senders.targeted)).boxed()
+        Box::new(move |rng: &mut dyn RngCore| {
+            senders.targeted[rng.random_range(0..senders.targeted.len())]
+        })
     }
 }
 
-/// Given a function, it returns a proptest strategy which generates valid abi-encoded calldata
+/// Given a function, it returns a generator which produces valid abi-encoded calldata
 /// for that function's input types.
 pub fn fuzz_contract_with_calldata<S: FuzzStateReader>(
     fuzz_state: &S,
     fuzz_fixtures: &FuzzFixtures,
     target: Address,
     func: Function,
-) -> impl Strategy<Value = CallDetails> + use<S> {
+) -> CallDetailsStrategy {
     let is_payable = func.state_mutability == alloy_json_abi::StateMutability::Payable;
-
-    // We need to compose all the strategies generated for each parameter in all possible
-    // combinations.
-    // `prop_oneof!` / `TupleUnion` `Arc`s for cheap cloning.
-    let calldata_strategy = prop_oneof![
-        60 => fuzz_calldata(func.clone(), fuzz_fixtures),
-        40 => fuzz_calldata_from_state(func, fuzz_state),
-    ];
-
-    // For payable functions, generate random value using shared strategy.
-    let value_strategy = if is_payable { fuzz_msg_value().boxed() } else { Just(None).boxed() };
-
-    (calldata_strategy, value_strategy).prop_map(move |(calldata, value)| {
+    // 60/40: fixtures-aware calldata vs. dictionary-state calldata.
+    let mut a: CalldataStrategy = fuzz_calldata(func.clone(), fuzz_fixtures);
+    let mut b: CalldataStrategy = fuzz_calldata_from_state(func, fuzz_state);
+    // For payable functions, generate random value using shared strategy. Otherwise, always None.
+    let mut value_strategy: MsgValueStrategy =
+        if is_payable { fuzz_msg_value() } else { Box::new(|_| None) };
+    Box::new(move |rng: &mut dyn RngCore| {
+        let calldata = if rng.random_ratio(60, 100) { a(rng) } else { b(rng) };
+        let value = value_strategy(rng);
         trace!(input=?calldata, ?value);
         CallDetails { target, calldata, value }
     })

@@ -3,6 +3,17 @@
 version = 4
 
 [[package]]
+name = "abi-fuzz"
+version = "0.1.0"
+dependencies = [
+ "alloy-dyn-abi",
+ "alloy-json-abi",
+ "alloy-primitives",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4586,6 +4597,7 @@ checksum = "932dcfbd51320af5f27f1ba02d2e567dec332cac7d2c221ba45d8e767264c4dc"
 name = "forge"
 version = "1.7.2"
 dependencies = [
+ "abi-fuzz",
  "alloy-chains",
  "alloy-consensus",
  "alloy-dyn-abi",
@@ -4633,7 +4645,6 @@ dependencies = [
  "opener",
  "parking_lot",
  "path-slash",
- "proptest",
  "quick-junit",
  "rand 0.9.4",
  "rayon",
@@ -4879,6 +4890,7 @@ dependencies = [
 name = "foundry-cheatcodes"
 version = "1.7.2"
 dependencies = [
+ "abi-fuzz",
  "alloy-chains",
  "alloy-consensus",
  "alloy-dyn-abi",
@@ -4905,7 +4917,6 @@ dependencies = [
  "foundry-compilers",
  "foundry-config",
  "foundry-evm-core",
- "foundry-evm-fuzz",
  "foundry-evm-traces",
  "foundry-wallets",
  "itertools 0.14.0",
@@ -4914,7 +4925,6 @@ dependencies = [
  "memchr",
  "p256",
  "parking_lot",
- "proptest",
  "rand 0.9.4",
  "revm",
  "revm-inspectors",
@@ -5261,12 +5271,14 @@ dependencies = [
 name = "foundry-evm"
 version = "1.7.2"
 dependencies = [
+ "abi-fuzz",
  "alloy-dyn-abi",
  "alloy-json-abi",
  "alloy-primitives",
  "alloy-rpc-types",
  "alloy-sol-types",
  "eyre",
+ "fixedbitset",
  "foundry-cheatcodes",
  "foundry-common",
  "foundry-compilers",
@@ -5280,7 +5292,7 @@ dependencies = [
  "foundry-evm-traces",
  "indicatif",
  "parking_lot",
- "proptest",
+ "rand 0.9.4",
  "rayon",
  "revm",
  "revm-inspectors",
@@ -5378,6 +5390,7 @@ dependencies = [
 name = "foundry-evm-fuzz"
 version = "1.7.2"
 dependencies = [
+ "abi-fuzz",
  "alloy-dyn-abi",
  "alloy-json-abi",
  "alloy-primitives",
@@ -5390,12 +5403,10 @@ dependencies = [
  "foundry-evm-traces",
  "itertools 0.14.0",
  "parking_lot",
- "proptest",
  "rand 0.9.4",
  "revm",
  "serde",
  "solar-compiler",
- "thiserror 2.0.18",
  "tracing",
 ]
 

@@ -8,6 +8,7 @@ use crate::{
     progress::{TestsProgress, start_fuzz_progress},
     result::{InvariantFailure, SuiteResult, TestResult, TestSetup},
 };
+use abi_fuzz::Runner;
 use alloy_dyn_abi::{DynSolValue, JsonAbiExt};
 use alloy_json_abi::Function;
 use alloy_primitives::{Address, Bytes, Selector, U256, address, map::HashMap};
@@ -36,7 +37,6 @@ use foundry_evm::{
     traces::{TraceKind, TraceMode, load_contracts},
 };
 use itertools::Itertools;
-use proptest::test_runner::{RngAlgorithm, TestError, TestRng, TestRunner};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -1103,9 +1103,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
                 let anchor_counterexample = match error {
                     InvariantFuzzError::BrokenInvariant(case_data)
                     | InvariantFuzzError::Revert(case_data) => {
-                        let TestError::Fail(_, ref calls) = case_data.test_error else {
-                            unreachable!("FailedInvariantCaseData::new always sets TestError::Fail")
-                        };
+                        let calls = &case_data.test_error.calls;
                         match replay_error(
                             evm.config(),
                             self.clone_executor(),
@@ -1181,8 +1179,8 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
                     && let Some(error) = invariant_result.errors.get(&invariant.name)
                     && let InvariantFuzzError::BrokenInvariant(case_data)
                     | InvariantFuzzError::Revert(case_data) = error
-                    && let TestError::Fail(_, ref calls) = case_data.test_error
                 {
+                    let calls = &case_data.test_error.calls;
                     let original_seq_len = calls.len();
                     // On Ctrl+C: skip the (potentially long) replay+shrink, but still persist
                     // the un-shrunk sequence so the next run targeting this invariant picks it
@@ -1486,14 +1484,12 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
         Ok(())
     }
 
-    fn fuzz_runner(&self) -> TestRunner {
-        let config = &self.config.fuzz;
-        fuzzer_with_cases(config.seed, config.runs, config.max_test_rejects)
+    fn fuzz_runner(&self) -> Runner {
+        fuzzer_with_cases(self.config.fuzz.seed)
     }
 
-    fn invariant_runner(&self) -> TestRunner {
-        let config = &self.config.invariant;
-        fuzzer_with_cases(self.config.fuzz.seed, config.runs, config.max_assume_rejects)
+    fn invariant_runner(&self) -> Runner {
+        fuzzer_with_cases(self.config.fuzz.seed)
     }
 
     fn clone_executor(&self) -> Executor<FEN> {
@@ -1522,23 +1518,13 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
     }
 }
 
-fn fuzzer_with_cases(seed: Option<U256>, cases: u32, max_global_rejects: u32) -> TestRunner {
-    let config = proptest::test_runner::Config {
-        cases,
-        max_global_rejects,
-        // Disable proptest shrink: for fuzz tests we provide single counterexample,
-        // for invariant tests we shrink outside proptest.
-        max_shrink_iters: 0,
-        ..Default::default()
-    };
-
+fn fuzzer_with_cases(seed: Option<U256>) -> Runner {
     if let Some(seed) = seed {
         trace!(target: "forge::test", %seed, "building deterministic fuzzer");
-        let rng = TestRng::from_seed(RngAlgorithm::ChaCha, &seed.to_be_bytes::<32>());
-        TestRunner::new_with_rng(config, rng)
+        Runner::seeded(seed.to_be_bytes::<32>())
     } else {
         trace!(target: "forge::test", "building stochastic fuzzer");
-        TestRunner::new(config)
+        Runner::random()
     }
 }
 
@@ -1599,6 +1585,7 @@ fn base_counterexamples_to_txes(
             BasicTxDetails {
                 warp: seq.warp,
                 roll: seq.roll,
+                deal: seq.deal,
                 sender: seq.sender.unwrap_or_default(),
                 call_details: CallDetails {
                     target: seq.addr.unwrap_or_default(),

@@ -1,7 +1,7 @@
 use super::{
     InvariantFailures, InvariantFuzzError, InvariantMetrics, InvariantTest, InvariantTestRun,
     call_after_invariant_function, call_invariant_function,
-    error::{InvariantRunCtx, record_handler_assertion_bug},
+    error::{InvariantRunCtx, TestFailure, record_handler_assertion_bug},
 };
 use crate::executors::{Executor, RawCallResult};
 use alloy_dyn_abi::JsonAbiExt;
@@ -22,7 +22,6 @@ use foundry_evm_fuzz::{
     BasicTxDetails, FuzzedCases,
     invariant::{FuzzRunIdentifiedContracts, InvariantContract},
 };
-use proptest::test_runner::TestError;
 use revm::interpreter::InstructionResult;
 use revm_inspectors::tracing::CallTraceArena;
 use std::{borrow::Cow, collections::HashMap};
@@ -344,10 +343,10 @@ pub(crate) fn can_continue<'a, FEN: FoundryEvmNetwork>(
                 let mut data = base.clone();
                 data.fail_on_revert = *fail_on_revert;
                 data.calldata = invariant.selector().to_vec().into();
-                data.test_error = TestError::Fail(
-                    format!("{}, reason: {}", invariant.name, data.revert_reason).into(),
-                    invariant_run.inputs.clone(),
-                );
+                data.test_error = TestFailure {
+                    reason: format!("{}, reason: {}", invariant.name, data.revert_reason),
+                    calls: invariant_run.inputs.clone(),
+                };
                 // Handler asserts go to `broken_handlers` above; `BrokenInvariant` arm kept
                 // for non-handler-routed assertion paths.
                 invariant_test.test_data.failures.record_failure(

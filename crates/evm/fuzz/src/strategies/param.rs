@@ -1,28 +1,29 @@
-use super::{UintStrategy, state::FuzzStateReader};
-use crate::{
-    invariant::SenderFilters,
-    strategies::mutators::{
-        BitMutator, GaussianNoiseMutator, IncrementDecrementMutator, InterestingWordMutator,
-    },
+use super::state::{FuzzDictionary, FuzzStateReader};
+use crate::invariant::SenderFilters;
+use abi_fuzz::{
+    Generator, Mutator,
+    generators::{IntDistribution, IntGenerator, RandomGenerator, UintDistribution, UintGenerator},
+    mutators::{self as fz, RecursiveMutator},
 };
-use alloy_dyn_abi::{DynSolType, DynSolValue, Word};
+use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_primitives::{Address, B256, I256, U256};
-use proptest::{prelude::*, strategy::ValueTree, test_runner::TestRunner};
-use rand::{SeedableRng, prelude::IndexedMutRandom, rngs::StdRng};
-use std::mem::replace;
+use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
 
 /// The max length of arrays we fuzz for is 256.
 const MAX_ARRAY_LEN: usize = 256;
+/// The max length of bytes/strings we fuzz for is 32.
+const MAX_BYTES_LEN: usize = 32;
 
-/// Given a parameter type, returns a strategy for generating values for that type.
-///
-/// See [`fuzz_param_with_fixtures`] for more information.
-pub fn fuzz_param(param: &DynSolType) -> BoxedStrategy<DynSolValue> {
+/// Closure-style "strategy": yields a fresh [`DynSolValue`] per call given an RNG.
+pub type ParamStrategy = Box<dyn FnMut(&mut dyn RngCore) -> DynSolValue>;
+
+/// Given a parameter type, returns a generator for values of that type.
+pub fn fuzz_param(param: &DynSolType) -> ParamStrategy {
     fuzz_param_inner(param, None)
 }
 
-/// Given a parameter type and configured fixtures for param name, returns a strategy for generating
-/// values for that type.
+/// Given a parameter type and configured fixtures for param name, returns a generator for values of
+/// that type.
 ///
 /// Fixtures can be currently generated for uint, int, address, bytes and
 /// string types and are defined for parameter name.
@@ -33,320 +34,270 @@ pub fn fuzz_param(param: &DynSolType) -> BoxedStrategy<DynSolValue> {
 /// `fixture_owner` function can be used in a fuzzed test function with a signature like
 /// `function testFuzz_ownerAddress(address owner, uint amount)`.
 ///
-/// Raises an error if all the fixture types are not of the same type as the input parameter.
+/// Logs an error if all the fixture types are not of the same type as the input parameter, and
+/// falls back to plain random generation in that case.
 ///
 /// Works with ABI Encoder v2 tuples.
 pub fn fuzz_param_with_fixtures(
     param: &DynSolType,
     fixtures: Option<&[DynSolValue]>,
     name: &str,
-) -> BoxedStrategy<DynSolValue> {
+) -> ParamStrategy {
     fuzz_param_inner(param, fixtures.map(|f| (f, name)))
 }
 
 fn fuzz_param_inner(
     param: &DynSolType,
     mut fuzz_fixtures: Option<(&[DynSolValue], &str)>,
-) -> BoxedStrategy<DynSolValue> {
+) -> ParamStrategy {
     if let Some((fixtures, name)) = fuzz_fixtures
         && !fixtures.iter().all(|f| f.matches(param))
     {
         error!("fixtures for {name:?} do not match type {param}");
         fuzz_fixtures = None;
     }
-    let fuzz_fixtures = fuzz_fixtures.map(|(f, _)| f);
+    let fixtures: Option<Vec<DynSolValue>> = fuzz_fixtures.map(|(f, _)| f.to_vec());
 
-    let value = || {
-        let default_strategy = DynSolValue::type_strategy(param);
-        if let Some(fixtures) = fuzz_fixtures {
-            proptest::prop_oneof![
-                50 => {
-                    let fixtures = fixtures.to_vec();
-                    any::<prop::sample::Index>()
-                        .prop_map(move |index| index.get(&fixtures).clone())
-                },
-                50 => default_strategy,
-            ]
-            .boxed()
-        } else {
-            default_strategy.boxed()
-        }
+    // Configure the generator's int/uint distribution from the param + fixtures. For non-int
+    // types the distribution is unused but the configuration is uniform anyway.
+    let (int_dist, uint_dist) = match *param {
+        DynSolType::Int(n @ 8..=256) => (
+            IntDistribution::Mixed(IntGenerator::new(n, int_fixtures(n, fixtures.as_deref()))),
+            UintDistribution::Uniform,
+        ),
+        DynSolType::Uint(n @ 8..=256) => (
+            IntDistribution::Uniform,
+            UintDistribution::Mixed(UintGenerator::new(n, uint_fixtures(n, fixtures.as_deref()))),
+        ),
+        _ => (IntDistribution::Uniform, UintDistribution::Uniform),
     };
-
-    match *param {
-        DynSolType::Address => value(),
-        DynSolType::Int(n @ 8..=256) => super::IntStrategy::new(n, fuzz_fixtures)
-            .prop_map(move |x| DynSolValue::Int(x, n))
-            .boxed(),
-        DynSolType::Uint(n @ 8..=256) => super::UintStrategy::new(n, fuzz_fixtures)
-            .prop_map(move |x| DynSolValue::Uint(x, n))
-            .boxed(),
-        DynSolType::Function | DynSolType::Bool => DynSolValue::type_strategy(param).boxed(),
-        DynSolType::Bytes => value(),
-        DynSolType::FixedBytes(_size @ 1..=32) => value(),
-        DynSolType::String => value()
-            .prop_map(move |value| {
-                DynSolValue::String(
-                    value.as_str().unwrap().trim().trim_end_matches('\0').to_string(),
-                )
-            })
-            .boxed(),
-        DynSolType::Tuple(ref params) => params
-            .iter()
-            .map(|param| fuzz_param_inner(param, None))
-            .collect::<Vec<_>>()
-            .prop_map(DynSolValue::Tuple)
-            .boxed(),
-        DynSolType::FixedArray(ref param, size) => {
-            proptest::collection::vec(fuzz_param_inner(param, None), size)
-                .prop_map(DynSolValue::FixedArray)
-                .boxed()
+    let mut g = RandomGenerator {
+        max_array_len: MAX_ARRAY_LEN,
+        max_bytes_len: MAX_BYTES_LEN,
+        int: int_dist,
+        uint: uint_dist,
+        ..Default::default()
+    };
+    let param = param.clone();
+    Box::new(move |rng: &mut dyn RngCore| {
+        let value = if let Some(ref f) = fixtures
+            && !f.is_empty()
+            && rng.random_ratio(50, 100)
+        {
+            f[rng.random_range(0..f.len())].clone()
+        } else {
+            g.generate(&param, rng)
+        };
+        if let DynSolValue::String(s) = value {
+            return DynSolValue::String(s.trim().trim_end_matches('\0').to_string());
         }
-        DynSolType::Array(ref param) => {
-            proptest::collection::vec(fuzz_param_inner(param, None), 0..MAX_ARRAY_LEN)
-                .prop_map(DynSolValue::Array)
-                .boxed()
-        }
-        _ => panic!("unsupported fuzz param type: {param}"),
-    }
+        value
+    })
 }
 
-/// Given a parameter type, returns a strategy for generating values for that type, given some EVM
+/// Filter `fixtures` to those that decode as `Int(bits)`. Mismatches log an error.
+fn int_fixtures(bits: usize, fixtures: Option<&[DynSolValue]>) -> Vec<I256> {
+    fixtures
+        .into_iter()
+        .flatten()
+        .filter_map(|v| match v.as_int() {
+            Some((i, w)) if w == bits => Some(i),
+            _ => {
+                error!("{v:?} is not a valid {} fixture", DynSolType::Int(bits));
+                None
+            }
+        })
+        .collect()
+}
+
+/// Filter `fixtures` to those that decode as `Uint(bits)`. Mismatches log an error.
+fn uint_fixtures(bits: usize, fixtures: Option<&[DynSolValue]>) -> Vec<U256> {
+    fixtures
+        .into_iter()
+        .flatten()
+        .filter_map(|v| match v.as_uint() {
+            Some((u, w)) if w == bits => Some(u),
+            _ => {
+                error!("{v:?} is not a valid {} fixture", DynSolType::Uint(bits));
+                None
+            }
+        })
+        .collect()
+}
+
+/// Given a parameter type, returns a generator for values of that type, given some EVM
 /// fuzz state.
 ///
+/// Composites recurse through abi-fuzz's [`RandomGenerator`], which consults the attached
+/// [`EvmFuzzStateDict`] at every leaf. The dict is responsible for type-routing: see
+/// [`EvmFuzzStateDict::sample`] for AST literal / typed-bucket / raw-state-value selection
+/// logic.
+///
+/// Note: this preserves foundry's legacy "always consult dict, fall to random only on
+/// `None`" behavior (`dict_bias = 100`). Echidna's default by comparison is `dictFreq = 0.40`
+/// (40% dict / 60% random); switching to that requires lowering `dict_bias` here.
+///
 /// Works with ABI Encoder v2 tuples.
-pub fn fuzz_param_from_state(
-    param: &DynSolType,
-    state: &impl FuzzStateReader,
-) -> BoxedStrategy<DynSolValue> {
-    // Value strategy that uses the state.
-    let value = || {
-        let state = state.clone();
-        let param = param.clone();
-        // Generate a bias and use it to pick samples or non-persistent values (50 / 50).
-        // Use `Index` instead of `Selector` when selecting a value to avoid iterating over the
-        // entire dictionary.
-        any::<(bool, prop::sample::Index)>().prop_map(move |(bias, index)| {
-            state.with_dictionary(|dict| {
-                let values = if bias { dict.samples(&param) } else { None }
-                    .unwrap_or_else(|| dict.values())
-                    .as_slice();
-                values[index.index(values.len())]
-            })
-        })
-    };
+pub fn fuzz_param_from_state<S: FuzzStateReader>(param: &DynSolType, state: &S) -> ParamStrategy {
+    let mut g = StateBackedGenerator::new(state);
+    let param = param.clone();
+    Box::new(move |rng: &mut dyn RngCore| {
+        let value = g.generate(&param, rng);
+        // Foundry-side post-process: trim whitespace + trailing NULs from random Strings.
+        // (Dict-sourced Strings already pass through untouched per AST harvesting.)
+        if let DynSolValue::String(s) = value {
+            return DynSolValue::String(s.trim().trim_end_matches('\0').to_string());
+        }
+        value
+    })
+}
 
-    // Convert the value based on the parameter type
-    match *param {
-        DynSolType::Address => {
-            let deployed_libs = state.deployed_libs().to_vec();
-            value()
-                .prop_map(move |value| {
-                    let mut fuzzed_addr = Address::from_word(value);
-                    if deployed_libs.contains(&fuzzed_addr) {
-                        let mut rng = StdRng::seed_from_u64(0x1337); // use deterministic rng
+/// Foundry's dictionary adapter over [`EvmFuzzState`].
+///
+/// Routes per-type into the right pool (Echidna: leaf-level oracle):
+/// - `Address`/`FixedBytes(n)`/`Uint(n)`/`Int(n)` → 50/50 typed-samples vs. raw state words, with
+///   appropriate decoding (deployed-libs avoidance for `Address`, modular wrap for `Uint`,
+///   sign-extension for `Int`, hi-byte mask for `FixedBytes`).
+/// - `String` → 30% chance of an AST string literal; otherwise `None` → fall to random gen.
+/// - `Bytes` → 10% AST string + 20% AST bytes + raw word fallback.
+/// - `Bool`/`Function`/composites → `None` (defer to random generation; composites get their leaves
+///   dict-biased recursively via the generator).
+#[derive(Clone)]
+struct EvmFuzzStateDict<S: FuzzStateReader> {
+    state: S,
+}
 
-                        // Do not use addresses of deployed libraries as fuzz input, instead return
-                        // a deterministically random address. We cannot filter out this value (via
-                        // `prop_filter_map`) as proptest can invoke this closure after test
-                        // execution, and returning a `None` will cause it to panic.
-                        // See <https://github.com/foundry-rs/foundry/issues/9764> and <https://github.com/foundry-rs/foundry/issues/8639>.
-                        loop {
-                            fuzzed_addr.randomize_with(&mut rng);
-                            if !deployed_libs.contains(&fuzzed_addr) {
-                                break;
-                            }
+impl<S: FuzzStateReader> EvmFuzzStateDict<S> {
+    fn sample(&self, ty: &DynSolType, rng: &mut dyn RngCore) -> Option<DynSolValue> {
+        self.state.with_dictionary(|dict| match ty {
+            DynSolType::Address => {
+                let word = sample_dict_word(dict, ty, rng)?;
+                let mut addr = Address::from_word(word);
+                if self.state.deployed_libs().contains(&addr) {
+                    let mut local_rng = StdRng::seed_from_u64(0x1337);
+                    loop {
+                        addr.randomize_with(&mut local_rng);
+                        if !self.state.deployed_libs().contains(&addr) {
+                            break;
                         }
                     }
-                    DynSolValue::Address(fuzzed_addr)
-                })
-                .boxed()
-        }
-        DynSolType::Function => value()
-            .prop_map(move |value| {
-                DynSolValue::Function(alloy_primitives::Function::from_word(value))
-            })
-            .boxed(),
-        DynSolType::FixedBytes(size @ 1..=32) => value()
-            .prop_map(move |mut v| {
-                v[size..].fill(0);
-                DynSolValue::FixedBytes(B256::from(v), size)
-            })
-            .boxed(),
-        DynSolType::Bool => DynSolValue::type_strategy(param).boxed(),
-        DynSolType::String => {
-            let state = state.clone();
-            (proptest::bool::weighted(0.3), any::<prop::sample::Index>())
-                .prop_flat_map(move |(use_ast, select_index)| {
-                    if let Some(value) = state.with_dictionary(|dict| {
-                        // AST string literals available: 30% probability
-                        let ast_strings = dict.ast_strings();
-                        if use_ast && !ast_strings.is_empty() {
-                            let s = &ast_strings.as_slice()[select_index.index(ast_strings.len())];
-                            return Some(DynSolValue::String(s.clone()));
-                        }
-                        None
-                    }) {
-                        return Just(value).boxed();
+                }
+                Some(DynSolValue::Address(addr))
+            }
+            DynSolType::FixedBytes(size @ 1..=32) => {
+                let mut word = sample_dict_word(dict, ty, rng)?;
+                word.0[*size..].fill(0);
+                Some(DynSolValue::FixedBytes(word, *size))
+            }
+            DynSolType::String => {
+                if rng.random_ratio(3, 10) {
+                    let strings = dict.ast_strings();
+                    if !strings.is_empty() {
+                        let s = &strings.as_slice()[rng.random_range(0..strings.len())];
+                        return Some(DynSolValue::String(s.clone()));
                     }
-
-                    // Fallback to random string generation
-                    DynSolValue::type_strategy(&DynSolType::String)
-                        .prop_map(|value| {
-                            DynSolValue::String(
-                                value.as_str().unwrap().trim().trim_end_matches('\0').to_string(),
-                            )
-                        })
-                        .boxed()
-                })
-                .boxed()
-        }
-        DynSolType::Bytes => {
-            let state_clone = state.clone();
-            (
-                value(),
-                proptest::bool::weighted(0.1),
-                proptest::bool::weighted(0.2),
-                any::<prop::sample::Index>(),
-            )
-                .prop_map(move |(word, use_ast_string, use_ast_bytes, select_index)| {
-                    if let Some(value) = state_clone.with_dictionary(|dict| {
-                        // Try string literals as bytes: 10% chance
-                        let ast_strings = dict.ast_strings();
-                        if use_ast_string && !ast_strings.is_empty() {
-                            let s = &ast_strings.as_slice()[select_index.index(ast_strings.len())];
-                            return Some(DynSolValue::Bytes(s.as_bytes().to_vec()));
-                        }
-
-                        // Try hex literals: 20% chance
-                        let ast_bytes = dict.ast_bytes();
-                        if use_ast_bytes && !ast_bytes.is_empty() {
-                            let bytes = &ast_bytes.as_slice()[select_index.index(ast_bytes.len())];
-                            return Some(DynSolValue::Bytes(bytes.to_vec()));
-                        }
-                        None
-                    }) {
-                        return value;
+                }
+                None
+            }
+            DynSolType::Bytes => {
+                if rng.random_ratio(1, 10) {
+                    let strings = dict.ast_strings();
+                    if !strings.is_empty() {
+                        let s = &strings.as_slice()[rng.random_range(0..strings.len())];
+                        return Some(DynSolValue::Bytes(s.as_bytes().to_vec()));
                     }
-
-                    // Fallback to the generated word from the dictionary: 70% chance
-                    DynSolValue::Bytes(word.0.into())
-                })
-                .boxed()
-        }
-        DynSolType::Int(n @ 8..=256) => match n / 8 {
-            32 => value()
-                .prop_map(move |value| DynSolValue::Int(I256::from_raw(value.into()), 256))
-                .boxed(),
-            1..=31 => value()
-                .prop_map(move |value| {
-                    // Extract lower N bits
-                    let uint_n = U256::from_be_bytes(value.0) % U256::from(1).wrapping_shl(n);
-                    // Interpret as signed int (two's complement) --> check sign bit (bit N-1).
+                }
+                if rng.random_ratio(2, 10) {
+                    let bytes = dict.ast_bytes();
+                    if !bytes.is_empty() {
+                        let b = &bytes.as_slice()[rng.random_range(0..bytes.len())];
+                        return Some(DynSolValue::Bytes(b.to_vec()));
+                    }
+                }
+                let word = sample_dict_word(dict, ty, rng)?;
+                Some(DynSolValue::Bytes(word.0.into()))
+            }
+            DynSolType::Int(n @ 8..=256) => {
+                let n = *n;
+                let word = sample_dict_word(dict, ty, rng)?;
+                let value = if n / 8 == 32 {
+                    I256::from_raw(U256::from_be_bytes(word.0))
+                } else {
+                    let uint_n = U256::from_be_bytes(word.0) % U256::from(1).wrapping_shl(n);
                     let sign_bit = U256::from(1) << (n - 1);
-                    let num = if uint_n >= sign_bit {
-                        // Negative number in two's complement
+                    if uint_n >= sign_bit {
                         let modulus = U256::from(1) << n;
                         I256::from_raw(uint_n.wrapping_sub(modulus))
                     } else {
-                        // Positive number
                         I256::from_raw(uint_n)
-                    };
-
-                    DynSolValue::Int(num, n)
-                })
-                .boxed(),
-            _ => unreachable!(),
-        },
-        DynSolType::Uint(n @ 8..=256) => match n / 8 {
-            32 => value()
-                .prop_map(move |value| DynSolValue::Uint(U256::from_be_bytes(value.0), 256))
-                .boxed(),
-            1..=31 => value()
-                .prop_map(move |value| {
-                    let uint = U256::from_be_bytes(value.0) % U256::from(1).wrapping_shl(n);
-                    DynSolValue::Uint(uint, n)
-                })
-                .boxed(),
-            _ => unreachable!(),
-        },
-        DynSolType::Tuple(ref params) => params
-            .iter()
-            .map(|p| fuzz_param_from_state(p, state))
-            .collect::<Vec<_>>()
-            .prop_map(DynSolValue::Tuple)
-            .boxed(),
-        DynSolType::FixedArray(ref param, size) => {
-            proptest::collection::vec(fuzz_param_from_state(param, state), size)
-                .prop_map(DynSolValue::FixedArray)
-                .boxed()
-        }
-        DynSolType::Array(ref param) => {
-            proptest::collection::vec(fuzz_param_from_state(param, state), 0..MAX_ARRAY_LEN)
-                .prop_map(DynSolValue::Array)
-                .boxed()
-        }
-        _ => panic!("unsupported fuzz param type: {param}"),
+                    }
+                };
+                Some(DynSolValue::Int(value, n))
+            }
+            DynSolType::Uint(n @ 8..=256) => {
+                let n = *n;
+                let word = sample_dict_word(dict, ty, rng)?;
+                let value = if n / 8 == 32 {
+                    U256::from_be_bytes(word.0)
+                } else {
+                    U256::from_be_bytes(word.0) % U256::from(1).wrapping_shl(n)
+                };
+                Some(DynSolValue::Uint(value, n))
+            }
+            // Bool/Function/composites: defer to random generation.
+            _ => None,
+        })
     }
 }
 
-/// Selects a random address for mutation, respecting sender filters if provided.
+/// 50/50 typed-samples vs. raw state-values; returns `None` when both pools are empty.
+fn sample_dict_word(dict: &FuzzDictionary, ty: &DynSolType, rng: &mut dyn RngCore) -> Option<B256> {
+    let bias = rng.random_ratio(1, 2);
+    let values =
+        if bias { dict.samples(ty) } else { None }.unwrap_or_else(|| dict.values()).as_slice();
+    if values.is_empty() { None } else { Some(values[rng.random_range(0..values.len())]) }
+}
+
+/// Selects a random address for mutation, biased toward targeted senders when
+/// available.
 ///
 /// Priority:
-/// 1. If `senders` has targeted addresses, pick randomly from those
-/// 2. Otherwise, pick from the dictionary state values (excluding any in `senders.excluded`)
-/// 3. Returns `None` if no suitable address is found or if the selected address equals `current`
-fn select_random_address(
+/// 1. If `senders` has targeted addresses, pick uniformly from those.
+/// 2. Otherwise, pick uniformly from the EVM fuzz dictionary's state values.
+///
+/// Returns `None` when the only candidate equals `current` (so callers know to
+/// retry / fall back). Excluded-sender fixup is **not** done here — it happens
+/// once at the run-loop boundary via [`SenderFilters::resolve`].
+pub(crate) fn select_random_address(
     current: Address,
-    test_runner: &mut TestRunner,
+    test_runner: &mut abi_fuzz::Runner,
     state: &impl FuzzStateReader,
     senders: Option<&SenderFilters>,
 ) -> Option<Address> {
-    if let Some(senders) = senders {
-        if !senders.targeted.is_empty() {
-            // Pick from targeted senders
-            let index = test_runner.rng().random_range(0..senders.targeted.len());
-            let addr = senders.targeted[index];
-            return (addr != current).then_some(addr);
-        }
-
-        // Pick from dictionary state values, excluding addresses in the exclusion list
-        state.with_dictionary(|dict| {
-            let values = dict.values();
-            if values.is_empty() {
-                return None;
-            }
-
-            // Try a few times to find a non-excluded address
-            for _ in 0..10 {
-                let index = test_runner.rng().random_range(0..values.len());
-                let addr = Address::from_word(values[index]);
-                if addr != current && !senders.excluded.contains(&addr) {
-                    return Some(addr);
-                }
-            }
-            None
-        })
-    } else {
-        // No sender filters, just pick from dictionary state values
-        state.with_dictionary(|dict| {
-            let values = dict.values();
-            if values.is_empty() {
-                None
-            } else {
-                let index = test_runner.rng().random_range(0..values.len());
-                let addr = Address::from_word(values[index]);
-                (addr != current).then_some(addr)
-            }
-        })
+    if let Some(senders) = senders
+        && !senders.targeted.is_empty()
+    {
+        let index = test_runner.rng().random_range(0..senders.targeted.len());
+        let addr = senders.targeted[index];
+        return (addr != current).then_some(addr);
     }
+
+    state.with_dictionary(|dict| {
+        let values = dict.values();
+        if values.is_empty() {
+            return None;
+        }
+        let index = test_runner.rng().random_range(0..values.len());
+        let addr = Address::from_word(values[index]);
+        (addr != current).then_some(addr)
+    })
 }
 
 /// Mutates the current value of the given parameter type and value.
 pub fn mutate_param_value(
     param: &DynSolType,
     value: DynSolValue,
-    test_runner: &mut TestRunner,
+    test_runner: &mut abi_fuzz::Runner,
     state: &impl FuzzStateReader,
 ) -> DynSolValue {
     mutate_param_value_inner(param, value, test_runner, state, None)
@@ -359,193 +310,123 @@ pub fn mutate_param_value(
 pub fn mutate_param_value_with_senders(
     param: &DynSolType,
     value: DynSolValue,
-    test_runner: &mut TestRunner,
+    test_runner: &mut abi_fuzz::Runner,
     state: &impl FuzzStateReader,
     senders: &SenderFilters,
 ) -> DynSolValue {
     mutate_param_value_inner(param, value, test_runner, state, Some(senders))
 }
 
+/// Foundry-side fallback [`Generator`] for the recursive mutator: a thin
+/// wrapper over [`RandomGenerator`] that uses Foundry's array-length cap and
+/// the EVM dictionary for "splice in a fresh value" fallbacks.
+struct StateBackedGenerator<S: FuzzStateReader> {
+    dict: EvmFuzzStateDict<S>,
+    inner: RandomGenerator,
+}
+
+impl<S: FuzzStateReader> StateBackedGenerator<S> {
+    fn new(state: &S) -> Self {
+        Self {
+            dict: EvmFuzzStateDict { state: state.clone() },
+            inner: RandomGenerator {
+                max_array_len: MAX_ARRAY_LEN,
+                max_bytes_len: MAX_BYTES_LEN,
+                int: IntDistribution::Uniform,
+                uint: UintDistribution::Uniform,
+                ..Default::default()
+            },
+        }
+    }
+}
+
+impl<S: FuzzStateReader> Generator for StateBackedGenerator<S> {
+    fn generate(&mut self, ty: &DynSolType, rng: &mut dyn RngCore) -> DynSolValue {
+        if let Some(value) = self.dict.sample(ty, rng) {
+            return value;
+        }
+        self.inner.generate(ty, rng)
+    }
+}
+
 fn mutate_param_value_inner(
     param: &DynSolType,
     value: DynSolValue,
-    test_runner: &mut TestRunner,
+    test_runner: &mut abi_fuzz::Runner,
     state: &impl FuzzStateReader,
     senders: Option<&SenderFilters>,
 ) -> DynSolValue {
-    let new_value = |param: &DynSolType, test_runner: &mut TestRunner| {
-        fuzz_param_from_state(param, state)
-            .new_tree(test_runner)
-            .expect("Could not generate case")
-            .current()
-    };
-
-    match value {
-        DynSolValue::Bool(val) => {
-            // flip boolean value
-            trace!(target: "mutator", "Bool flip {val}");
-            Some(DynSolValue::Bool(!val))
-        }
-        DynSolValue::Uint(val, size) => match test_runner.rng().random_range(0..=6) {
-            0 => U256::increment_decrement(val, size, test_runner),
-            1 => U256::flip_random_bit(val, size, test_runner),
-            2 => U256::mutate_interesting_byte(val, size, test_runner),
-            3 => U256::mutate_interesting_word(val, size, test_runner),
-            4 => U256::mutate_interesting_dword(val, size, test_runner),
-            5 => U256::mutate_with_gaussian_noise(val, size, test_runner),
-            6 => None,
-            _ => unreachable!(),
-        }
-        .map(|v| DynSolValue::Uint(v, size)),
-        DynSolValue::Int(val, size) => match test_runner.rng().random_range(0..=6) {
-            0 => I256::increment_decrement(val, size, test_runner),
-            1 => I256::flip_random_bit(val, size, test_runner),
-            2 => I256::mutate_interesting_byte(val, size, test_runner),
-            3 => I256::mutate_interesting_word(val, size, test_runner),
-            4 => I256::mutate_interesting_dword(val, size, test_runner),
-            5 => I256::mutate_with_gaussian_noise(val, size, test_runner),
-            6 => None,
-            _ => unreachable!(),
-        }
-        .map(|v| DynSolValue::Int(v, size)),
-        DynSolValue::Address(val) => match test_runner.rng().random_range(0..=5) {
-            0 => Address::flip_random_bit(val, 20, test_runner),
-            1 => Address::mutate_interesting_byte(val, 20, test_runner),
-            2 => Address::mutate_interesting_word(val, 20, test_runner),
-            3 => Address::mutate_interesting_dword(val, 20, test_runner),
+    // Top-level Address gets foundry's dict + senders bias; everything else
+    // falls through to the abi-fuzz recursive mutator (which itself bottoms out
+    // in `StateBackedGenerator` for "splice in a fresh value" fallbacks).
+    if let DynSolValue::Address(val) = value {
+        return match test_runner.rng().random_range(0..=5u32) {
             // Replace with a random address from targeted senders or dictionary.
             4 => select_random_address(val, test_runner, state, senders),
             5 => None,
-            _ => unreachable!(),
+            _ => fz::mutate_address(val, test_runner.rng()), /* TODO cycle through fixed list
+                                                              * most of the time? */
         }
-        .map(DynSolValue::Address),
-        DynSolValue::Array(mut values) => {
-            if let DynSolType::Array(param_type) = param
-                && !values.is_empty()
-            {
-                match test_runner.rng().random_range(0..=2) {
-                    // Decrease array size by removing a random element.
-                    0 => {
-                        values.remove(test_runner.rng().random_range(0..values.len()));
-                    }
-                    // Increase array size.
-                    1 => values.push(new_value(param_type, test_runner)),
-                    // Mutate random array element.
-                    2 => mutate_random_array_value(
-                        &mut values,
-                        param_type,
-                        test_runner,
-                        state,
-                        senders,
-                    ),
-                    _ => unreachable!(),
-                }
-                Some(DynSolValue::Array(values))
-            } else {
-                None
-            }
-        }
-        DynSolValue::FixedArray(mut values) => {
-            if let DynSolType::FixedArray(param_type, _size) = param
-                && !values.is_empty()
-            {
-                mutate_random_array_value(&mut values, param_type, test_runner, state, senders);
-                Some(DynSolValue::FixedArray(values))
-            } else {
-                None
-            }
-        }
-        DynSolValue::FixedBytes(word, size) => match test_runner.rng().random_range(0..=4) {
-            0 => Word::flip_random_bit(word, size, test_runner),
-            1 => Word::mutate_interesting_byte(word, size, test_runner),
-            2 => Word::mutate_interesting_word(word, size, test_runner),
-            3 => Word::mutate_interesting_dword(word, size, test_runner),
-            4 => None,
-            _ => unreachable!(),
-        }
-        .map(|word| DynSolValue::FixedBytes(word, size)),
-        DynSolValue::CustomStruct { name, prop_names, tuple: mut values } => {
-            if let DynSolType::CustomStruct { name: _, prop_names: _, tuple: tuple_types }
-            | DynSolType::Tuple(tuple_types) = param
-                && !values.is_empty()
-            {
-                // Mutate random struct element.
-                mutate_random_tuple_value(&mut values, tuple_types, test_runner, state, senders);
-                Some(DynSolValue::CustomStruct { name, prop_names, tuple: values })
-            } else {
-                None
-            }
-        }
-        DynSolValue::Tuple(mut values) => {
-            if let DynSolType::Tuple(tuple_types) = param
-                && !values.is_empty()
-            {
-                // Mutate random tuple element.
-                mutate_random_tuple_value(&mut values, tuple_types, test_runner, state, senders);
-                Some(DynSolValue::Tuple(values))
-            } else {
-                None
-            }
-        }
-        _ => None,
+        .map(DynSolValue::Address)
+        .unwrap_or_else(|| StateBackedGenerator::new(state).generate(param, test_runner.rng()));
     }
-    .unwrap_or_else(|| new_value(param, test_runner))
+
+    let mut mutator = RecursiveMutator {
+        generator: StateBackedGenerator::new(state),
+        max_array_len: MAX_ARRAY_LEN,
+    };
+    mutator.mutate(param, value, test_runner.rng())
 }
 
-/// Mutates random value from given tuples.
-fn mutate_random_tuple_value(
-    tuple_values: &mut [DynSolValue],
-    tuple_types: &[DynSolType],
-    test_runner: &mut TestRunner,
-    state: &impl FuzzStateReader,
-    senders: Option<&SenderFilters>,
-) {
-    let id = test_runner.rng().random_range(0..tuple_values.len());
-    let param_type = &tuple_types[id];
-    let old_val = replace(&mut tuple_values[id], DynSolValue::Bool(false));
-    let new_val = mutate_param_value_inner(param_type, old_val, test_runner, state, senders);
-    tuple_values[id] = new_val;
-}
+/// 0.001 ETH in wei.
+const MILLI_ETH: u64 = 1_000_000_000_000_000;
+/// 1 ETH in wei.
+const ONE_ETH: u64 = 1_000_000_000_000_000_000;
 
-/// Mutates random value from given array.
-fn mutate_random_array_value(
-    array_values: &mut [DynSolValue],
-    element_type: &DynSolType,
-    test_runner: &mut TestRunner,
-    state: &impl FuzzStateReader,
-    senders: Option<&SenderFilters>,
-) {
-    let elem = array_values.choose_mut(&mut test_runner.rng()).unwrap();
-    let old_val = replace(elem, DynSolValue::Bool(false));
-    let new_val = mutate_param_value_inner(element_type, old_val, test_runner, state, senders);
-    *elem = new_val;
-}
+/// Closure-style "strategy" yielding an optional `msg.value` per call.
+pub type MsgValueStrategy = Box<dyn FnMut(&mut dyn RngCore) -> Option<U256>>;
 
-/// Probability (out of 100) that a payable call carries a non-zero msg.value.
-const PAYABLE_VALUE_PROB: u32 = 15;
-
-/// Returns a proptest strategy for generating random msg.value for payable functions.
+/// Returns a closure yielding random `msg.value` for payable functions, biased
+/// toward smaller values to avoid balance issues.
 ///
-/// Most calls (85%) carry no value. The remaining 15% delegate to [`UintStrategy`],
-/// which biases toward edge cases (around 0 / max) and dictionary fixtures, with
-/// random fallback. Over-budget values are clamped to sender balance at execute time.
-pub fn fuzz_msg_value() -> impl Strategy<Value = Option<U256>> {
-    proptest::prop_oneof![
-        100 - PAYABLE_VALUE_PROB => proptest::strategy::Just(None),
-        PAYABLE_VALUE_PROB       => UintStrategy::new(256, None).prop_map(Some),
-    ]
+/// Distribution:
+/// - 85% chance: no value (None)
+/// - 10% chance: small values (0-1000 wei)
+/// - 4% chance: medium values (up to 0.001 ETH)
+/// - 1% chance: larger values (up to 1 ETH)
+pub fn fuzz_msg_value() -> MsgValueStrategy {
+    Box::new(|rng: &mut dyn RngCore| match rng.random_range(0..100u32) {
+        // 85% chance: no value.
+        0..=84 => None,
+        // 10% chance: small values (0-1000 wei).
+        85..=94 => Some(U256::from(rng.random_range(0u64..=1000))),
+        // 4% chance: medium values (up to 0.001 ETH).
+        95..=98 => Some(U256::from(rng.random_range(0u64..=MILLI_ETH))),
+        // 1% chance: larger values (up to 1 ETH).
+        _ => Some(U256::from(rng.random_range(0u64..=ONE_ETH))),
+    })
 }
 
-/// Generates a msg.value for payable functions using `TestRunner`'s RNG (corpus mutation path).
+/// Generates a random `msg.value` for payable functions, biased toward smaller
+/// values to avoid balance issues.
 ///
-/// Mirrors [`fuzz_msg_value`] by sampling from [`UintStrategy`]. The 15% mutation gate is
-/// applied at the call site in `corpus.rs`. Over-budget values are clamped to sender
-/// balance at execute time.
-pub fn generate_msg_value(test_runner: &mut TestRunner) -> U256 {
-    UintStrategy::new(256, None)
-        .new_tree(test_runner)
-        .expect("UintStrategy::new_tree is infallible")
-        .current()
+/// Distribution:
+/// - 60% chance: small values (0-1000 wei)
+/// - 30% chance: medium values (up to 0.001 ETH)
+/// - 9% chance: larger values (up to 1 ETH)
+/// - 1% chance: max value (edge case)
+pub fn generate_msg_value(test_runner: &mut abi_fuzz::Runner) -> U256 {
+    let rng = test_runner.rng();
+    match rng.random_range(0..=10) {
+        // Small values (0-1000 wei) - 60% chance.
+        0..=5 => U256::from(rng.random_range(0u64..=1000)),
+        // Medium values (up to 0.001 ETH) - 30% chance.
+        6..=8 => U256::from(rng.random_range(0u64..=MILLI_ETH)),
+        // Larger values (up to 1 ETH) - 9% chance.
+        9 => U256::from(rng.random_range(0u64..=ONE_ETH)),
+        // Edge case (max) - 1% chance.
+        _ => U256::MAX,
+    }
 }
 
 #[cfg(test)]
@@ -554,8 +435,10 @@ mod tests {
         FuzzFixtures,
         strategies::{EvmFuzzState, fuzz_calldata, fuzz_calldata_from_state},
     };
+    use abi_fuzz::Runner;
     use alloy_primitives::B256;
     use foundry_common::abi::get_func;
+    use rand::Rng;
     use std::collections::HashSet;
 
     #[test]
@@ -563,13 +446,16 @@ mod tests {
         let f = "testArray(uint64[2] calldata values)";
         let func = get_func(f).unwrap();
         let state = EvmFuzzState::test();
-        let strategy = proptest::prop_oneof![
-            60 => fuzz_calldata(func.clone(), &FuzzFixtures::default()),
-            40 => fuzz_calldata_from_state(func, &state),
-        ];
-        let cfg = proptest::test_runner::Config { failure_persistence: None, ..Default::default() };
-        let mut runner = proptest::test_runner::TestRunner::new(cfg);
-        let _ = runner.run(&strategy, |_| Ok(()));
+        let mut runner = Runner::seeded([0u8; 32]);
+        let mut a = fuzz_calldata(func.clone(), &FuzzFixtures::default());
+        let mut b = fuzz_calldata_from_state(func, &state);
+        for _ in 0..32 {
+            if runner.rng().random_ratio(60, 100) {
+                let _ = a(runner.rng());
+            } else {
+                let _ = b(runner.rng());
+            }
+        }
     }
 
     #[test]
@@ -578,7 +464,6 @@ mod tests {
         use crate::strategies::LiteralMaps;
         use alloy_dyn_abi::DynSolType;
         use alloy_primitives::keccak256;
-        use proptest::strategy::Strategy;
 
         // Seed dict with string values and their hashes --> mimic `CheatcodeAnalysis` behavior.
         let mut literals = LiteralMaps::default();
@@ -590,32 +475,31 @@ mod tests {
         let mut state = EvmFuzzState::test();
         state.seed_literals(literals);
 
-        let cfg = proptest::test_runner::Config { failure_persistence: None, ..Default::default() };
-        let mut runner = proptest::test_runner::TestRunner::new(cfg);
+        let mut runner = Runner::seeded([0u8; 32]);
 
-        // Verify strategies generates the seeded AST literals
+        // Verify generators produce the seeded AST literals
         let mut generated_bytes = HashSet::new();
         let mut generated_hashes = HashSet::new();
         let mut generated_strings = HashSet::new();
-        let bytes_strategy = fuzz_param_from_state(&DynSolType::Bytes, &state);
-        let string_strategy = fuzz_param_from_state(&DynSolType::String, &state);
-        let bytes32_strategy = fuzz_param_from_state(&DynSolType::FixedBytes(32), &state);
+        let mut bytes_strategy = fuzz_param_from_state(&DynSolType::Bytes, &state);
+        let mut string_strategy = fuzz_param_from_state(&DynSolType::String, &state);
+        let mut bytes32_strategy = fuzz_param_from_state(&DynSolType::FixedBytes(32), &state);
 
         for _ in 0..256 {
-            let tree = bytes_strategy.new_tree(&mut runner).unwrap();
-            if let Some(bytes) = tree.current().as_bytes()
+            let v = bytes_strategy(runner.rng());
+            if let Some(bytes) = v.as_bytes()
                 && let Ok(s) = std::str::from_utf8(bytes)
             {
                 generated_bytes.insert(s.to_string());
             }
 
-            let tree = string_strategy.new_tree(&mut runner).unwrap();
-            if let Some(s) = tree.current().as_str() {
+            let v = string_strategy(runner.rng());
+            if let Some(s) = v.as_str() {
                 generated_strings.insert(s.to_string());
             }
 
-            let tree = bytes32_strategy.new_tree(&mut runner).unwrap();
-            if let Some((bytes, size)) = tree.current().as_fixed_bytes()
+            let v = bytes32_strategy(runner.rng());
+            if let Some((bytes, size)) = v.as_fixed_bytes()
                 && size == 32
             {
                 generated_hashes.insert(B256::from_slice(bytes));
@@ -644,8 +528,7 @@ mod tests {
         let addr3 = Address::repeat_byte(0x33);
         state.collect_values([addr1.into_word(), addr2.into_word(), addr3.into_word()]);
 
-        let cfg = proptest::test_runner::Config { failure_persistence: None, ..Default::default() };
-        let mut runner = proptest::test_runner::TestRunner::new(cfg);
+        let mut runner = Runner::seeded([0u8; 32]);
 
         // Mutate an address many times and verify we can get addresses from the dictionary.
         let original = Address::repeat_byte(0xff);
@@ -700,8 +583,7 @@ mod tests {
         let targeted2 = Address::repeat_byte(0x22);
         let senders = SenderFilters::new(vec![targeted1, targeted2], vec![]);
 
-        let cfg = proptest::test_runner::Config { failure_persistence: None, ..Default::default() };
-        let mut runner = proptest::test_runner::TestRunner::new(cfg);
+        let mut runner = Runner::seeded([0u8; 32]);
 
         // Call select_random_address directly to verify it uses targeted senders.
         let original = Address::repeat_byte(0xff);
@@ -736,44 +618,19 @@ mod tests {
     }
 
     #[test]
-    fn mutate_address_respects_excluded_senders() {
-        use super::select_random_address;
-        use crate::invariant::SenderFilters;
+    fn excluded_senders_are_remapped_to_fallback_at_execution_boundary() {
+        use crate::invariant::{FALLBACK_SENDER, SenderFilters};
         use alloy_primitives::Address;
 
-        let mut state = EvmFuzzState::test();
+        let allowed = Address::repeat_byte(0x11);
+        let excluded = Address::repeat_byte(0xee);
+        let filters = SenderFilters::new(vec![], vec![excluded]);
 
-        // Add addresses to dictionary.
-        let addr1 = Address::repeat_byte(0x11);
-        let addr2 = Address::repeat_byte(0x22);
-        let excluded_addr = Address::repeat_byte(0xee);
-        state.collect_values([addr1.into_word(), addr2.into_word(), excluded_addr.into_word()]);
-
-        // Exclude one address.
-        let senders = SenderFilters::new(vec![], vec![excluded_addr]);
-
-        let cfg = proptest::test_runner::Config { failure_persistence: None, ..Default::default() };
-        let mut runner = proptest::test_runner::TestRunner::new(cfg);
-
-        // Call select_random_address directly to verify it respects excluded senders.
-        let original = Address::repeat_byte(0xff);
-        let mut got_excluded = false;
-        let mut got_valid = false;
-
-        for _ in 0..100 {
-            if let Some(addr) = select_random_address(original, &mut runner, &state, Some(&senders))
-            {
-                if addr == excluded_addr {
-                    got_excluded = true;
-                    break;
-                }
-                if addr == addr1 || addr == addr2 {
-                    got_valid = true;
-                }
-            }
-        }
-
-        assert!(!got_excluded, "select_random_address should not select excluded addresses");
-        assert!(got_valid, "select_random_address should select valid (non-excluded) addresses");
+        // Allowed addresses pass through unchanged…
+        assert_eq!(filters.resolve(allowed), allowed);
+        // …while excluded addresses fall back to the deterministic 0x30000.
+        assert_eq!(filters.resolve(excluded), FALLBACK_SENDER);
+        // address(0) is excluded by default per `SenderFilters::new`.
+        assert_eq!(filters.resolve(Address::ZERO), FALLBACK_SENDER);
     }
 }
