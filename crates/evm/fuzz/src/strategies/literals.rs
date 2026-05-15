@@ -1,4 +1,4 @@
-use alloy_dyn_abi::DynSolType;
+use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_primitives::{
     B256, Bytes, I256, U256, keccak256,
     map::{B256IndexSet, HashMap, IndexSet},
@@ -62,11 +62,75 @@ impl LiteralsDictionary {
         self.maps.wait()
     }
 
+    /// Returns all harvested source literals as typed ABI tokens.
+    pub fn typed_values(&self) -> impl Iterator<Item = (DynSolType, DynSolValue)> {
+        literal_map_typed_values(self.get())
+    }
+
     /// Test-only helper to seed the dictionary with literal values.
     #[cfg(test)]
     pub(crate) fn set(&mut self, map: super::LiteralMaps) {
         self.maps = Arc::new(OnceLock::new());
         self.maps.set(map).unwrap();
+    }
+}
+
+pub(crate) fn literal_map_typed_values(
+    maps: &LiteralMaps,
+) -> impl Iterator<Item = (DynSolType, DynSolValue)> {
+    let word_values = maps.words.iter().flat_map(|(ty, values)| {
+        values
+            .iter()
+            .filter_map(|word| word_to_typed_value(ty, *word).map(|value| (ty.clone(), value)))
+    });
+    let strings =
+        maps.strings.iter().cloned().map(|value| (DynSolType::String, DynSolValue::String(value)));
+    let bytes = maps
+        .bytes
+        .iter()
+        .cloned()
+        .map(|value| (DynSolType::Bytes, DynSolValue::Bytes(value.to_vec())));
+
+    word_values.chain(strings).chain(bytes)
+}
+
+pub(crate) fn word_to_typed_value(ty: &DynSolType, word: B256) -> Option<DynSolValue> {
+    match ty {
+        DynSolType::Address => {
+            Some(DynSolValue::Address(alloy_primitives::Address::from_word(word)))
+        }
+        DynSolType::FixedBytes(size @ 1..=32) => {
+            let mut word = word;
+            word.0[*size..].fill(0);
+            Some(DynSolValue::FixedBytes(word, *size))
+        }
+        DynSolType::Bytes => Some(DynSolValue::Bytes(word.0.into())),
+        DynSolType::Int(n @ 8..=256) => {
+            let n = *n;
+            let value = if n / 8 == 32 {
+                I256::from_raw(U256::from_be_bytes(word.0))
+            } else {
+                let uint_n = U256::from_be_bytes(word.0) % U256::from(1).wrapping_shl(n);
+                let sign_bit = U256::from(1) << (n - 1);
+                if uint_n >= sign_bit {
+                    let modulus = U256::from(1) << n;
+                    I256::from_raw(uint_n.wrapping_sub(modulus))
+                } else {
+                    I256::from_raw(uint_n)
+                }
+            };
+            Some(DynSolValue::Int(value, n))
+        }
+        DynSolType::Uint(n @ 8..=256) => {
+            let n = *n;
+            let value = if n / 8 == 32 {
+                U256::from_be_bytes(word.0)
+            } else {
+                U256::from_be_bytes(word.0) % U256::from(1).wrapping_shl(n)
+            };
+            Some(DynSolValue::Uint(value, n))
+        }
+        _ => None,
     }
 }
 
