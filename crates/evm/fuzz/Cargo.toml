@@ -1,6 +1,6 @@
 [package]
 name = "foundry-evm-fuzz"
-description = "EVM fuzzing implementation using `proptest`"
+description = "EVM fuzzing implementation using `abi-fuzz`"
 
 version.workspace = true
 edition.workspace = true
@@ -45,10 +45,10 @@ revm = { workspace = true, features = [
 eyre.workspace = true
 itertools.workspace = true
 parking_lot.workspace = true
-proptest.workspace = true
 rand.workspace = true
+
+abi-fuzz.workspace = true
 serde.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 
 [features]

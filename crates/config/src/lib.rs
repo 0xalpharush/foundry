@@ -4166,7 +4166,6 @@ mod tests {
                 [fuzz]
                 runs = 256
                 seed = '0x3e8'
-                max_test_rejects = 65536
 
                 [invariant]
                 runs = 256
@@ -7527,7 +7526,6 @@ mod tests {
 
                 [profile.ci-venom.fuzz]
                 runs = 10000
-                max_test_rejects = 350000
 
                 [profile.ci-venom.invariant]
                 runs = 375
@@ -7541,7 +7539,6 @@ mod tests {
             assert_eq!(config.profile.as_str(), "ci-venom");
             assert_eq!(config.optimizer_runs, Some(500));
             assert_eq!(config.fuzz.runs, 10000);
-            assert_eq!(config.fuzz.max_test_rejects, 350000);
             assert_eq!(config.invariant.runs, 375);
             assert_eq!(config.invariant.depth, 500);
 

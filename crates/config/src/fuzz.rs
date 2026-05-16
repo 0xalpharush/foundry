@@ -16,9 +16,6 @@ pub struct FuzzConfig {
     pub worker: Option<u32>,
     /// Fails the fuzzed test if a revert occurs.
     pub fail_on_revert: bool,
-    /// The maximum number of test case rejections allowed,
-    /// encountered during usage of `vm.assume` cheatcode.
-    pub max_test_rejects: u32,
     /// Optional seed for the fuzzing RNG algorithm
     pub seed: Option<U256>,
     /// The fuzz dictionary configuration
@@ -44,7 +41,6 @@ impl Default for FuzzConfig {
             run: None,
             worker: None,
             fail_on_revert: true,
-            max_test_rejects: 65536,
             seed: None,
             dictionary: FuzzDictionaryConfig::default(),
             gas_report_samples: 256,

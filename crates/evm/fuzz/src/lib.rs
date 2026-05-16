@@ -1,6 +1,6 @@
 //! # foundry-evm-fuzz
 //!
-//! EVM fuzzing implementation using [`proptest`].
+//! EVM fuzzing implementation using [`abi_fuzz`].
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -20,11 +20,6 @@ use foundry_evm_traces::{CallTraceArena, SparsedTraceArena};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::{fmt, sync::Arc};
-
-pub use proptest::test_runner::{Config as FuzzConfig, Reason};
-
-mod error;
-pub use error::FuzzError;
 
 pub mod invariant;
 pub mod strategies;
@@ -63,6 +58,9 @@ pub struct BasicTxDetails {
     /// Number to increase block number before executing the tx.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roll: Option<U256>,
+    /// Amount to deal (add) to sender's balance before executing the tx.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deal: Option<U256>,
     /// Transaction sender address.
     pub sender: Address,
     /// Transaction call details.
@@ -105,6 +103,8 @@ pub struct BaseCounterExample {
     pub warp: Option<U256>,
     // Amount to increase block number.
     pub roll: Option<U256>,
+    // Amount to deal (add) to sender's balance.
+    pub deal: Option<U256>,
     /// Address which makes the call.
     pub sender: Option<Address>,
     /// Address to which to call to.
@@ -149,6 +149,7 @@ impl BaseCounterExample {
         let value = tx.call_details.value;
         let warp = tx.warp;
         let roll = tx.roll;
+        let deal = tx.deal;
         if let Some((name, abi)) = &contracts.get(&target)
             && let Some(func) = abi.functions().find(|f| f.selector() == bytes[..4])
         {
@@ -157,6 +158,7 @@ impl BaseCounterExample {
                 return Self {
                     warp,
                     roll,
+                    deal,
                     sender: Some(sender),
                     addr: Some(target),
                     calldata: bytes.clone(),
@@ -178,6 +180,7 @@ impl BaseCounterExample {
         Self {
             warp,
             roll,
+            deal,
             sender: Some(sender),
             addr: Some(target),
             calldata: bytes.clone(),
@@ -202,6 +205,7 @@ impl BaseCounterExample {
         Self {
             warp: None,
             roll: None,
+            deal: None,
             sender: None,
             addr: None,
             calldata: bytes,
@@ -236,6 +240,9 @@ impl fmt::Display for BaseCounterExample {
             }
             if let Some(roll) = &self.roll {
                 writeln!(f, "\t\tvm.roll(block.number + {roll});")?;
+            }
+            if let Some(deal) = &self.deal {
+                writeln!(f, "\t\tvm.deal({sender}, {sender}.balance + {deal});")?;
             }
             writeln!(f, "\t\tvm.prank({sender});")?;
             // Use value syntax for payable calls.
@@ -282,6 +289,16 @@ impl fmt::Display for BaseCounterExample {
         }
         if let Some(roll) = &self.roll {
             write!(f, "roll={roll} ")?;
+        }
+        if let Some(deal) = &self.deal {
+            write!(f, "deal={deal} ")?;
+        }
+
+        // Display value if non-zero (for payable calls).
+        if let Some(value) = &self.value
+            && !value.is_zero()
+        {
+            write!(f, "value={value} ")?;
         }
 
         // Display value if non-zero (for payable calls).

@@ -35,6 +35,7 @@
 //!   entries since it doesn't matter as long as the corpus eventually syncs across all workers
 
 use crate::executors::{Executor, RawCallResult, invariant::execute_tx};
+use abi_fuzz::{Runner, mutators::seq::Position};
 use alloy_dyn_abi::JsonAbiExt;
 use alloy_json_abi::Function;
 use alloy_primitives::{Bytes, I256};
@@ -49,12 +50,7 @@ use foundry_evm_fuzz::{
         EvmFuzzState, FuzzStateReader, InvariantFuzzState, generate_msg_value, mutate_param_value,
     },
 };
-use proptest::{
-    prelude::{Just, Rng, Strategy},
-    prop_oneof,
-    strategy::{BoxedStrategy, ValueTree},
-    test_runner::TestRunner,
-};
+use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::{
     fmt,
@@ -80,13 +76,16 @@ const COVERAGE_MAP_SIZE: usize = 65536;
 const GZIP_THRESHOLD: usize = 4 * 1024;
 
 /// Possible mutation strategies to apply on a call sequence.
-#[derive(Debug, Clone)]
+///
+/// Selected by weight via [`abi_fuzz::mutators::seq::weighted_pick`] and dispatched to the
+/// matching list mutator from [`abi_fuzz::mutators::seq`].
+#[derive(Debug, Clone, Copy)]
 enum MutationType {
-    /// Splice original call sequence.
+    /// Splice random sub-ranges of two corpus sequences.
     Splice,
-    /// Repeat selected call several times.
+    /// Repeat a single tx by inserting `N` copies at a random position.
     Repeat,
-    /// Interleave calls from two random call sequences.
+    /// Interleave the prefixes of two corpus sequences one-by-one.
     Interleave,
     /// Replace prefix of the original call sequence with new calls.
     Prefix,
@@ -94,7 +93,23 @@ enum MutationType {
     Suffix,
     /// ABI mutate random args of selected call in sequence.
     Abi,
+    /// Swap two distinct positions in the sequence.
+    Swap,
+    /// Delete a random position from the sequence.
+    Delete,
 }
+
+/// Weighted dispatch table used to pick a [`MutationType`] each iteration.
+const CORPUS_MUTATION_WEIGHTS: &[(MutationType, u32)] = &[
+    (MutationType::Splice, 100),
+    (MutationType::Repeat, 500),
+    (MutationType::Interleave, 100),
+    (MutationType::Prefix, 300),
+    (MutationType::Suffix, 500),
+    (MutationType::Abi, 300),
+    (MutationType::Swap, 500),
+    (MutationType::Delete, 500),
+];
 
 /// Persisted optimization state: the best value found and the sequence that produced it.
 #[derive(Clone, Serialize, Deserialize)]
@@ -267,9 +282,7 @@ pub struct WorkerCorpus {
     /// Worker Metrics
     pub(crate) metrics: CorpusMetrics,
     /// Fuzzed calls generator.
-    tx_generator: BoxedStrategy<BasicTxDetails>,
-    /// Call sequence mutation strategy type generator used by stateful fuzzing.
-    mutation_generator: BoxedStrategy<MutationType>,
+    tx_generator: Box<dyn FnMut(&mut dyn RngCore) -> BasicTxDetails>,
     /// Identifier of current mutated entry for this worker.
     current_mutated: Option<Uuid>,
     /// Config
@@ -293,22 +306,12 @@ impl WorkerCorpus {
     pub fn new<FEN: FoundryEvmNetwork>(
         id: usize,
         config: FuzzCorpusConfig,
-        tx_generator: BoxedStrategy<BasicTxDetails>,
+        tx_generator: Box<dyn FnMut(&mut dyn RngCore) -> BasicTxDetails>,
         // Only required by master worker (id = 0) to replay existing corpus.
         executor: Option<&Executor<FEN>>,
         fuzzed_function: Option<&Function>,
         fuzzed_contracts: Option<&FuzzRunIdentifiedContracts>,
     ) -> Result<Self> {
-        let mutation_generator = prop_oneof![
-            Just(MutationType::Splice),
-            Just(MutationType::Repeat),
-            Just(MutationType::Interleave),
-            Just(MutationType::Prefix),
-            Just(MutationType::Suffix),
-            Just(MutationType::Abi),
-        ]
-        .boxed();
-
         let worker_dir = config.corpus_dir.as_ref().map(|corpus_dir| {
             let worker_dir = corpus_dir.join(format!("{WORKER}{id}"));
             let worker_corpus = worker_dir.join(CORPUS_DIR);
@@ -418,7 +421,6 @@ impl WorkerCorpus {
             failed_replays,
             metrics,
             tx_generator,
-            mutation_generator,
             current_mutated: None,
             config: config.into(),
             new_entry_indices: Default::default(),
@@ -575,7 +577,7 @@ impl WorkerCorpus {
     #[instrument(skip_all)]
     pub fn new_inputs(
         &mut self,
-        test_runner: &mut TestRunner,
+        test_runner: &mut Runner,
         fuzz_state: &InvariantFuzzState,
         targeted_contracts: &FuzzRunIdentifiedContracts,
     ) -> Result<Vec<BasicTxDetails>> {
@@ -591,11 +593,10 @@ impl WorkerCorpus {
         if !self.in_memory_corpus.is_empty() {
             self.evict_oldest_corpus()?;
 
-            let mutation_type = self
-                .mutation_generator
-                .new_tree(test_runner)
-                .map_err(|err| eyre!("Could not generate mutation type {err}"))?
-                .current();
+            let mutation_type =
+                abi_fuzz::mutators::seq::weighted_pick(CORPUS_MUTATION_WEIGHTS, test_runner.rng())
+                    .copied()
+                    .ok_or_else(|| eyre!("invalid corpus mutation weights"))?;
 
             let rng = test_runner.rng();
             let corpus_len = self.in_memory_corpus.len();
@@ -605,68 +606,61 @@ impl WorkerCorpus {
             match mutation_type {
                 MutationType::Splice => {
                     trace!(target: "corpus", "splice {} and {}", primary.uuid, secondary.uuid);
-
                     self.current_mutated = Some(primary.uuid);
-
-                    let start1 = rng.random_range(0..primary.tx_seq.len());
-                    let end1 = rng.random_range(start1..primary.tx_seq.len());
-
-                    let start2 = rng.random_range(0..secondary.tx_seq.len());
-                    let end2 = rng.random_range(start2..secondary.tx_seq.len());
-
-                    for tx in primary.tx_seq.iter().take(end1).skip(start1) {
-                        new_seq.push(tx.clone());
-                    }
-                    for tx in secondary.tx_seq.iter().take(end2).skip(start2) {
-                        new_seq.push(tx.clone());
-                    }
+                    new_seq =
+                        abi_fuzz::mutators::seq::splice(&primary.tx_seq, &secondary.tx_seq, rng);
                 }
                 MutationType::Repeat => {
                     let corpus = if rng.random::<bool>() { primary } else { secondary };
                     trace!(target: "corpus", "repeat {}", corpus.uuid);
-
                     self.current_mutated = Some(corpus.uuid);
-
-                    new_seq = corpus.tx_seq.clone();
-                    let start = rng.random_range(0..corpus.tx_seq.len());
-                    let end = rng.random_range(start..corpus.tx_seq.len());
-                    let item_idx = rng.random_range(0..corpus.tx_seq.len());
-                    let repeated = vec![new_seq[item_idx].clone(); end - start];
-                    new_seq.splice(start..end, repeated);
+                    if let Some(range) = abi_fuzz::mutators::seq::positioned_range(
+                        corpus.tx_seq.len(),
+                        Position::Any,
+                        1,
+                        rng,
+                    ) {
+                        let repetitions = rng.random_range(1..32);
+                        new_seq = abi_fuzz::mutators::seq::repeat_insert(
+                            &corpus.tx_seq,
+                            range,
+                            repetitions,
+                            rng,
+                        );
+                    }
                 }
                 MutationType::Interleave => {
                     trace!(target: "corpus", "interleave {} with {}", primary.uuid, secondary.uuid);
-
                     self.current_mutated = Some(primary.uuid);
-
-                    for (tx1, tx2) in primary.tx_seq.iter().zip(secondary.tx_seq.iter()) {
-                        // TODO: chunks?
-                        let tx = if rng.random::<bool>() { tx1.clone() } else { tx2.clone() };
-                        new_seq.push(tx);
-                    }
+                    new_seq = abi_fuzz::mutators::seq::interleave(
+                        &primary.tx_seq,
+                        &secondary.tx_seq,
+                        rng,
+                    );
                 }
                 MutationType::Prefix => {
                     let corpus = if rng.random::<bool>() { primary } else { secondary };
                     trace!(target: "corpus", "overwrite prefix of {}", corpus.uuid);
-
                     self.current_mutated = Some(corpus.uuid);
-
-                    new_seq = corpus.tx_seq.clone();
-                    for i in 0..rng.random_range(0..=new_seq.len()) {
-                        new_seq[i] = self.new_tx(test_runner)?;
-                    }
+                    let src = corpus.tx_seq.clone();
+                    let tx_generator = &mut self.tx_generator;
+                    let res: Result<Vec<_>, std::convert::Infallible> =
+                        abi_fuzz::mutators::seq::prefix_replace(&src, test_runner.rng(), |rng| {
+                            Ok(tx_generator(rng))
+                        });
+                    new_seq = res.unwrap();
                 }
                 MutationType::Suffix => {
                     let corpus = if rng.random::<bool>() { primary } else { secondary };
                     trace!(target: "corpus", "overwrite suffix of {}", corpus.uuid);
-
                     self.current_mutated = Some(corpus.uuid);
-
-                    new_seq = corpus.tx_seq.clone();
-                    for i in new_seq.len() - rng.random_range(0..new_seq.len())..corpus.tx_seq.len()
-                    {
-                        new_seq[i] = self.new_tx(test_runner)?;
-                    }
+                    let src = corpus.tx_seq.clone();
+                    let tx_generator = &mut self.tx_generator;
+                    let res: Result<Vec<_>, std::convert::Infallible> =
+                        abi_fuzz::mutators::seq::suffix_replace(&src, test_runner.rng(), |rng| {
+                            Ok(tx_generator(rng))
+                        });
+                    new_seq = res.unwrap();
                 }
                 MutationType::Abi => {
                     let targets = targeted_contracts.targets();
@@ -679,12 +673,40 @@ impl WorkerCorpus {
 
                     let idx = rng.random_range(0..new_seq.len());
                     let tx = new_seq.get_mut(idx).unwrap();
-                    if let (_, Some(function)) = targets.fuzzed_artifacts(tx) {
-                        // TODO: add call_value to call details and mutate it as well as sender some
-                        // of the time.
-                        if !function.inputs.is_empty() {
-                            self.abi_mutate(tx, function, test_runner, fuzz_state)?;
-                        }
+                    if let (_, Some(function)) = targets.fuzzed_artifacts(tx)
+                        && !function.inputs.is_empty()
+                    {
+                        self.abi_mutate(tx, function, test_runner, fuzz_state)?;
+                    }
+                }
+                MutationType::Swap => {
+                    let corpus = if rng.random::<bool>() { primary } else { secondary };
+                    trace!(target: "corpus", "swap calls in {}", corpus.uuid);
+                    self.current_mutated = Some(corpus.uuid);
+                    if let Some(range) = abi_fuzz::mutators::seq::positioned_range(
+                        corpus.tx_seq.len(),
+                        Position::Any,
+                        2,
+                        rng,
+                    ) {
+                        new_seq =
+                            abi_fuzz::mutators::seq::swap_distinct(&corpus.tx_seq, range, rng);
+                    }
+                }
+                MutationType::Delete => {
+                    let corpus = if rng.random::<bool>() { primary } else { secondary };
+                    trace!(target: "corpus", "delete a call in {}", corpus.uuid);
+                    self.current_mutated = Some(corpus.uuid);
+                    // Leave at least one call in the sequence.
+                    if corpus.tx_seq.len() > 1
+                        && let Some(range) = abi_fuzz::mutators::seq::positioned_range(
+                            corpus.tx_seq.len(),
+                            Position::Any,
+                            1,
+                            rng,
+                        )
+                    {
+                        new_seq = abi_fuzz::mutators::seq::delete_at(&corpus.tx_seq, range, rng);
                     }
                 }
             }
@@ -704,7 +726,7 @@ impl WorkerCorpus {
     #[instrument(skip_all)]
     pub fn new_input(
         &mut self,
-        test_runner: &mut TestRunner,
+        test_runner: &mut Runner,
         fuzz_state: &EvmFuzzState,
         function: &Function,
     ) -> Result<Bytes> {
@@ -730,12 +752,8 @@ impl WorkerCorpus {
     }
 
     /// Generates single call from corpus strategy.
-    pub fn new_tx(&self, test_runner: &mut TestRunner) -> Result<BasicTxDetails> {
-        Ok(self
-            .tx_generator
-            .new_tree(test_runner)
-            .map_err(|_| eyre!("Could not generate case"))?
-            .current())
+    pub fn new_tx(&mut self, test_runner: &mut Runner) -> Result<BasicTxDetails> {
+        Ok((self.tx_generator)(test_runner.rng()))
     }
 
     /// Returns the next call to be used in call sequence.
@@ -746,7 +764,7 @@ impl WorkerCorpus {
     /// sequence.
     pub fn generate_next_input(
         &mut self,
-        test_runner: &mut TestRunner,
+        test_runner: &mut Runner,
         sequence: &[BasicTxDetails],
         discarded: bool,
         depth: usize,
@@ -801,7 +819,7 @@ impl WorkerCorpus {
         &self,
         tx: &mut BasicTxDetails,
         function: &Function,
-        test_runner: &mut TestRunner,
+        test_runner: &mut Runner,
         fuzz_state: &impl FuzzStateReader,
     ) -> Result<()> {
         // Mutate value with 15% probability for payable functions.
@@ -1224,6 +1242,7 @@ mod tests {
         BasicTxDetails {
             warp: None,
             roll: None,
+            deal: None,
             sender: Address::ZERO,
             call_details: foundry_evm_fuzz::CallDetails {
                 target: Address::ZERO,
@@ -1240,7 +1259,8 @@ mod tests {
     }
 
     fn new_manager_with_single_corpus() -> (WorkerCorpus, Uuid) {
-        let tx_gen = Just(basic_tx()).boxed();
+        let tx_gen: Box<dyn FnMut(&mut dyn RngCore) -> BasicTxDetails + Send> =
+            Box::new(|_rng: &mut dyn RngCore| basic_tx());
         let config = FuzzCorpusConfig {
             corpus_dir: Some(temp_corpus_dir()),
             corpus_gzip: false,
@@ -1261,7 +1281,6 @@ mod tests {
         let manager = WorkerCorpus {
             id: 0,
             tx_generator: tx_gen,
-            mutation_generator: Just(MutationType::Repeat).boxed(),
             config: config.into(),
             in_memory_corpus: vec![corpus],
             current_mutated: Some(seed_uuid),
@@ -1347,7 +1366,8 @@ mod tests {
     #[test]
     fn eviction_skips_favored_and_evicts_non_favored() {
         // Manager with two corpora.
-        let tx_gen = Just(basic_tx()).boxed();
+        let tx_gen: Box<dyn FnMut(&mut dyn RngCore) -> BasicTxDetails + Send> =
+            Box::new(|_rng: &mut dyn RngCore| basic_tx());
         let config = FuzzCorpusConfig {
             corpus_dir: Some(temp_corpus_dir()),
             corpus_min_mutations: 0,
@@ -1371,7 +1391,6 @@ mod tests {
         let mut manager = WorkerCorpus {
             id: 0,
             tx_generator: tx_gen,
-            mutation_generator: Just(MutationType::Repeat).boxed(),
             config: config.into(),
             in_memory_corpus: vec![favored, non_favored],
             current_mutated: None,

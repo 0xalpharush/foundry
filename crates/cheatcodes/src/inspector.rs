@@ -20,6 +20,7 @@ use crate::{
     },
     utils::IgnoredTraces,
 };
+use abi_fuzz::Runner;
 use alloy_consensus::BlobTransactionSidecarVariant;
 use alloy_network::{Ethereum, Network, TransactionBuilder};
 use alloy_primitives::{
@@ -48,7 +49,6 @@ use foundry_evm_traces::{
 };
 use foundry_wallets::wallet_multi::MultiWallet;
 use itertools::Itertools;
-use proptest::test_runner::{RngAlgorithm, TestRng, TestRunner};
 use rand::Rng;
 use revm::{
     Inspector,
@@ -551,9 +551,9 @@ pub struct Cheatcodes<FEN: FoundryEvmNetwork = EthEvmNetwork> {
     /// Whether the next contract creation should be intercepted to return its initcode.
     pub intercept_next_create_call: bool,
 
-    /// Optional cheatcodes `TestRunner`. Used for generating random values from uint and int
+    /// Optional cheatcodes `Runner`. Used for generating random values from uint and int
     /// strategies.
-    test_runner: Option<TestRunner>,
+    test_runner: Option<Runner>,
 
     /// Ignored traces.
     pub ignored_traces: IgnoredTraces,
@@ -1135,21 +1135,15 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
         self.test_runner().rng()
     }
 
-    pub fn test_runner(&mut self) -> &mut TestRunner {
+    pub fn test_runner(&mut self) -> &mut Runner {
         self.test_runner.get_or_insert_with(|| match self.config.seed {
-            Some(seed) => TestRunner::new_with_rng(
-                proptest::test_runner::Config::default(),
-                TestRng::from_seed(RngAlgorithm::ChaCha, &seed.to_be_bytes::<32>()),
-            ),
-            None => TestRunner::new(proptest::test_runner::Config::default()),
+            Some(seed) => Runner::seeded(seed.to_be_bytes::<32>()),
+            None => Runner::random(),
         })
     }
 
     pub fn set_seed(&mut self, seed: U256) {
-        self.test_runner = Some(TestRunner::new_with_rng(
-            proptest::test_runner::Config::default(),
-            TestRng::from_seed(RngAlgorithm::ChaCha, &seed.to_be_bytes::<32>()),
-        ));
+        self.test_runner = Some(Runner::seeded(seed.to_be_bytes::<32>()));
     }
 
     /// Returns existing or set a default `ArbitraryStorage` option.

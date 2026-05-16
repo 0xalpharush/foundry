@@ -801,9 +801,10 @@ fn reorder_type(ty: DynSolType, struct_defs: &StructDefinitions) -> Result<DynSo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use abi_fuzz::{Generator, Runner, generators::RandomGenerator};
     use alloy_primitives::FixedBytes;
     use foundry_common::fmt::{TypeDefMap, serialize_value_as_json};
-    use proptest::{arbitrary::any, prop_oneof, strategy::Strategy};
+    use rand::{Rng, RngCore};
     use std::collections::HashSet;
 
     fn valid_value(value: &DynSolValue) -> bool {
@@ -841,71 +842,140 @@ mod tests {
         }
     }
 
-    fn guessable_types() -> impl proptest::strategy::Strategy<Value = DynSolValue> {
-        any::<DynSolValue>().prop_map(fixup_guessable).prop_filter("invalid value", valid_value)
+    /// Random `DynSolType` picker for the json roundtrip tests.
+    /// Limited to the primitives + 1-deep arrays (matches the original `any::<DynSolValue>()`
+    /// proptest coverage closely enough for the round-trip checks).
+    fn random_dyn_sol_type(rng: &mut dyn RngCore) -> DynSolType {
+        let primitives = [
+            DynSolType::Bool,
+            DynSolType::Address,
+            DynSolType::Bytes,
+            DynSolType::String,
+            DynSolType::Uint(256),
+            DynSolType::Int(256),
+            DynSolType::Uint(64),
+            DynSolType::Int(64),
+            DynSolType::FixedBytes(32),
+            DynSolType::FixedBytes(20),
+        ];
+        match rng.random_range(0..12u8) {
+            0..=8 => primitives[rng.random_range(0..primitives.len())].clone(),
+            9 => DynSolType::Array(Box::new(
+                primitives[rng.random_range(0..primitives.len())].clone(),
+            )),
+            10 => DynSolType::FixedArray(
+                Box::new(primitives[rng.random_range(0..primitives.len())].clone()),
+                1 + rng.random_range(0..4u8) as usize,
+            ),
+            _ => primitives[rng.random_range(0..primitives.len())].clone(),
+        }
     }
 
-    /// A proptest strategy for generating a (simple) `DynSolValue::CustomStruct`
-    /// and its corresponding `StructDefinitions` object.
-    fn custom_struct_strategy() -> impl Strategy<Value = (StructDefinitions, DynSolValue)> {
-        // Define a strategy for basic field names and values.
-        let field_name_strat = "[a-z]{4,12}";
-        let field_value_strat = prop_oneof![
-            any::<bool>().prop_map(DynSolValue::Bool),
-            any::<u32>().prop_map(|v| DynSolValue::Uint(U256::from(v), 256)),
-            any::<[u8; 20]>().prop_map(Address::from).prop_map(DynSolValue::Address),
-            any::<[u8; 32]>().prop_map(B256::from).prop_map(|b| DynSolValue::FixedBytes(b, 32)),
-            ".*".prop_map(DynSolValue::String),
-        ];
+    /// Random custom struct generator for `test_json_roundtrip_with_struct_defs`.
+    /// Mirrors the prior proptest strategy: random `[A-Z][a-z]{4,8}` struct name with
+    /// 1..=7 unique `[a-z]{4,12}` fields holding bool/uint32/address/bytes32/string values.
+    fn random_custom_struct(rng: &mut dyn RngCore) -> (StructDefinitions, DynSolValue) {
+        fn lower_ident(rng: &mut dyn RngCore, min: usize, max: usize) -> String {
+            let len = rng.random_range(min..=max);
+            (0..len).map(|_| (b'a' + rng.random_range(0..26u8)) as char).collect()
+        }
+        fn upper_lead_ident(rng: &mut dyn RngCore, min_tail: usize, max_tail: usize) -> String {
+            let mut s = String::new();
+            s.push((b'A' + rng.random_range(0..26u8)) as char);
+            let tail_len = rng.random_range(min_tail..=max_tail);
+            for _ in 0..tail_len {
+                s.push((b'a' + rng.random_range(0..26u8)) as char);
+            }
+            s
+        }
+        fn random_string(rng: &mut dyn RngCore) -> String {
+            // Keep printable ASCII so json round-trip is unambiguous.
+            let len = rng.random_range(0..=16usize);
+            (0..len).map(|_| (b' ' + rng.random_range(0..95u8)) as char).collect()
+        }
 
-        // Combine them to create a list of unique fields that preserve the random order.
-        let fields_strat = proptest::collection::vec((field_name_strat, field_value_strat), 1..8)
-            .prop_map(|fields| {
-                let mut unique_fields = Vec::with_capacity(fields.len());
-                let mut seen_names = HashSet::new();
-                for (name, value) in fields {
-                    if seen_names.insert(name.clone()) {
-                        unique_fields.push((name, value));
-                    }
+        let n_fields = rng.random_range(1..=7usize);
+        let mut unique_fields: Vec<(String, DynSolValue)> = Vec::with_capacity(n_fields);
+        let mut seen_names = HashSet::new();
+        while unique_fields.len() < n_fields {
+            let name = lower_ident(rng, 4, 12);
+            if !seen_names.insert(name.clone()) {
+                continue;
+            }
+            let value = match rng.random_range(0..5u8) {
+                0 => DynSolValue::Bool(rng.random()),
+                1 => DynSolValue::Uint(U256::from(rng.next_u32()), 256),
+                2 => {
+                    let mut buf = [0u8; 20];
+                    rng.fill_bytes(&mut buf);
+                    DynSolValue::Address(Address::from(buf))
                 }
-                unique_fields
-            });
+                3 => {
+                    let mut buf = [0u8; 32];
+                    rng.fill_bytes(&mut buf);
+                    DynSolValue::FixedBytes(B256::from(buf), 32)
+                }
+                _ => DynSolValue::String(random_string(rng)),
+            };
+            unique_fields.push((name, value));
+        }
 
-        // Generate the `CustomStruct` and its definition.
-        ("[A-Z][a-z]{4,8}", fields_strat).prop_map(|(struct_name, fields)| {
-            let (prop_names, tuple): (Vec<String>, Vec<DynSolValue>) =
-                fields.clone().into_iter().unzip();
-            let def_fields: Vec<(String, String)> = fields
-                .iter()
-                .map(|(name, value)| (name.clone(), value.as_type().unwrap().to_string()))
-                .collect();
-            let mut defs_map = TypeDefMap::default();
-            defs_map.insert(struct_name.clone(), def_fields);
-            (defs_map.into(), DynSolValue::CustomStruct { name: struct_name, prop_names, tuple })
-        })
+        let struct_name = upper_lead_ident(rng, 4, 8);
+        let (prop_names, tuple): (Vec<String>, Vec<DynSolValue>) =
+            unique_fields.clone().into_iter().unzip();
+        let def_fields: Vec<(String, String)> = unique_fields
+            .iter()
+            .map(|(name, value)| (name.clone(), value.as_type().unwrap().to_string()))
+            .collect();
+        let mut defs_map = TypeDefMap::default();
+        defs_map.insert(struct_name.clone(), def_fields);
+        (defs_map.into(), DynSolValue::CustomStruct { name: struct_name, prop_names, tuple })
     }
 
     // Tests to ensure that conversion [DynSolValue] -> [serde_json::Value] -> [DynSolValue]
-    proptest::proptest! {
-        #[test]
-        fn test_json_roundtrip_guessed(v in guessable_types()) {
+    // round-trips. The proptest macro is replaced with plain loops driven by an
+    // `abi_fuzz::Runner` so the test suite no longer depends on proptest.
+    #[test]
+    fn test_json_roundtrip_guessed() {
+        let mut runner = Runner::seeded([0u8; 32]);
+        let mut g = RandomGenerator::default();
+        for _ in 0..256 {
+            let ty = random_dyn_sol_type(runner.rng());
+            let raw = g.generate(&ty, runner.rng());
+            let v = fixup_guessable(raw);
+            if !valid_value(&v) {
+                continue;
+            }
             let json = serialize_value_as_json(v.clone(), None).unwrap();
             let value = json_value_to_token(&json, None).unwrap();
-
-            // do additional abi_encode -> abi_decode to avoid zero signed integers getting decoded as unsigned and causing assert_eq to fail.
+            // do additional abi_encode -> abi_decode to avoid zero signed integers getting decoded
+            // as unsigned and causing assert_eq to fail.
             let decoded = v.as_type().unwrap().abi_decode(&value.abi_encode()).unwrap();
             assert_eq!(decoded, v);
         }
+    }
 
-        #[test]
-        fn test_json_roundtrip(v in any::<DynSolValue>().prop_filter("filter out values without type", |v| v.as_type().is_some())) {
+    #[test]
+    fn test_json_roundtrip() {
+        let mut runner = Runner::seeded([0u8; 32]);
+        let mut g = RandomGenerator::default();
+        for _ in 0..256 {
+            let ty = random_dyn_sol_type(runner.rng());
+            let v = g.generate(&ty, runner.rng());
+            if v.as_type().is_none() {
+                continue;
+            }
             let json = serialize_value_as_json(v.clone(), None).unwrap();
             let value = parse_json_as(&json, &v.as_type().unwrap()).unwrap();
             assert_eq!(value, v);
         }
+    }
 
-        #[test]
-        fn test_json_roundtrip_with_struct_defs((struct_defs, v) in custom_struct_strategy()) {
+    #[test]
+    fn test_json_roundtrip_with_struct_defs() {
+        let mut runner = Runner::seeded([0u8; 32]);
+        for _ in 0..256 {
+            let (struct_defs, v) = random_custom_struct(runner.rng());
             let json = serialize_value_as_json(v.clone(), Some(&struct_defs)).unwrap();
             let sol_type = v.as_type().unwrap();
             let parsed_value = parse_json_as(&json, &sol_type).unwrap();

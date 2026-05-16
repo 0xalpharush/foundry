@@ -16,7 +16,7 @@ pub use call_override::RandomCallGenerator;
 
 mod filters;
 use crate::BasicTxDetails;
-pub use filters::{ArtifactFilters, SenderFilters};
+pub use filters::{ArtifactFilters, FALLBACK_SENDER, SenderFilters};
 use foundry_common::{ContractsByAddress, ContractsByArtifact};
 use foundry_evm_core::utils::{StateChangeset, get_function};
 

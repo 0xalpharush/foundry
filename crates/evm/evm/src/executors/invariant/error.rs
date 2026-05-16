@@ -7,9 +7,18 @@ use foundry_evm_core::{
     decode::{ASSERTION_FAILED_PREFIX, EMPTY_REVERT_DATA, RevertDecoder},
     evm::FoundryEvmNetwork,
 };
-use foundry_evm_fuzz::{BasicTxDetails, Reason, invariant::FuzzRunIdentifiedContracts};
-use proptest::test_runner::TestError;
+use foundry_evm_fuzz::{BasicTxDetails, invariant::FuzzRunIdentifiedContracts};
 use std::{collections::HashMap, fmt};
+
+/// Local replacement for `proptest::test_runner::TestError`. Foundry only ever used the
+/// `Fail(reason, calls)` variant, so this minimal struct captures both fields.
+#[derive(Clone, Debug)]
+pub struct TestFailure {
+    /// Failure reason (matches the legacy `Reason` shape — a plain string).
+    pub reason: String,
+    /// The call sequence that produced the failure.
+    pub calls: Vec<BasicTxDetails>,
+}
 
 /// A handler-side assertion bug: a `require`/`assert` inside a fuzzed handler that the
 /// campaign reached. Deduped by `(reverter, selector)` site (Echidna/Medusa semantics),
@@ -81,10 +90,10 @@ impl<'a> InvariantRunCtx<'a> {
         let revert_reason = self.decode_revert_reason(&call_result, assertion_failure);
         let origin = broken_fn.name.as_str();
         FailedInvariantCaseData {
-            test_error: TestError::Fail(
-                format!("{origin}, reason: {revert_reason}").into(),
-                self.calldata.to_vec(),
-            ),
+            test_error: TestFailure {
+                reason: format!("{origin}, reason: {revert_reason}"),
+                calls: self.calldata.to_vec(),
+            },
             return_reason: "".into(),
             revert_reason,
             addr: self.contract.address,
@@ -400,10 +409,10 @@ impl InvariantFuzzError {
 
 #[derive(Clone, Debug)]
 pub struct FailedInvariantCaseData {
-    /// The proptest error occurred as a result of a test case.
-    pub test_error: TestError<Vec<BasicTxDetails>>,
+    /// The error that occurred as a result of a test case.
+    pub test_error: TestFailure,
     /// The return reason of the offending call.
-    pub return_reason: Reason,
+    pub return_reason: String,
     /// The revert string of the offending call.
     pub revert_reason: String,
     /// Address of the invariant asserter.
@@ -418,4 +427,58 @@ pub struct FailedInvariantCaseData {
     pub fail_on_revert: bool,
     /// Whether this failure originated from a handler assertion.
     pub assertion_failure: bool,
+}
+
+impl FailedInvariantCaseData {
+    pub fn new<FEN: FoundryEvmNetwork>(
+        invariant_contract: &InvariantContract<'_>,
+        invariant_config: &InvariantConfig,
+        targeted_contracts: &FuzzRunIdentifiedContracts,
+        calldata: &[BasicTxDetails],
+        call_result: RawCallResult<FEN>,
+        inner_sequence: &[Option<BasicTxDetails>],
+    ) -> Self {
+        // Collect abis of fuzzed and invariant contracts to decode custom error.
+        let targets = targeted_contracts.targets();
+        let revert_reason = RevertDecoder::new()
+            .with_abis(targets.values().map(|c| &c.abi))
+            .with_abi(invariant_contract.abi)
+            .decode(call_result.result.as_ref(), call_result.exit_reason);
+        // Non-reverting assertion failures surface through Foundry's failure flags instead of
+        // revert data. Use a stable fallback so invariant output is not blank.
+        let revert_reason =
+            if !call_result.reverted && matches!(revert_reason.as_str(), "" | EMPTY_REVERT_DATA) {
+                ASSERTION_FAILED_PREFIX.to_string()
+            } else {
+                revert_reason
+            };
+
+        let func = invariant_contract.anchor();
+        debug_assert!(func.inputs.is_empty());
+        let origin = func.name.as_str();
+        Self {
+            test_error: TestFailure {
+                reason: format!("{origin}, reason: {revert_reason}"),
+                calls: calldata.to_vec(),
+            },
+            return_reason: String::new(),
+            revert_reason,
+            addr: invariant_contract.address,
+            calldata: func.selector().to_vec().into(),
+            inner_sequence: inner_sequence.to_vec(),
+            shrink_run_limit: invariant_config.shrink_run_limit,
+            fail_on_revert: invariant_config.fail_on_revert,
+            assertion_failure: false,
+        }
+    }
+
+    /// Marks this case as assertion-originated and normalizes empty decoded revert data from
+    /// non-reverting assertion paths into a stable user-facing message.
+    pub fn with_assertion_failure(mut self, assertion_failure: bool) -> Self {
+        self.assertion_failure = assertion_failure;
+        if assertion_failure && matches!(self.revert_reason.as_str(), "" | EMPTY_REVERT_DATA) {
+            self.revert_reason = ASSERTION_FAILED_PREFIX.to_string();
+        }
+        self
+    }
 }

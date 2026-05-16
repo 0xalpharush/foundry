@@ -1,29 +1,31 @@
 use crate::{BasicTxDetails, CallDetails};
+use abi_fuzz::Runner;
 use alloy_primitives::Address;
 use parking_lot::{Mutex, RwLock};
-use proptest::{
-    option::weighted,
-    strategy::{SBoxedStrategy, Strategy, ValueTree},
-    test_runner::TestRunner,
-};
+use rand::{Rng, RngCore};
 use std::{collections::HashSet, sync::Arc};
 
-/// Given a TestRunner and a strategy, it generates calls. Used inside the Fuzzer inspector to
+/// Closure-style strategy yielding an `Option<CallDetails>` per draw.
+type WeightedCallStrategy = Box<dyn FnMut(&mut dyn RngCore) -> Option<CallDetails> + Send + Sync>;
+
+/// Given a Runner and a strategy, it generates calls. Used inside the Fuzzer inspector to
 /// override external calls to test for potential reentrancy vulnerabilities.
 ///
 /// The key insight is that we only override calls TO handler contracts (targeted contracts).
 /// This simulates a malicious contract that reenters when receiving ETH via its receive() function.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RandomCallGenerator {
     /// Address of the test contract.
     pub test_address: Address,
     /// Addresses of handler contracts that can be reentered.
     /// We only inject callbacks when the call target is one of these.
     pub handler_addresses: Arc<RwLock<HashSet<Address>>>,
-    /// Runner that will generate the call from the strategy.
-    pub runner: Arc<Mutex<TestRunner>>,
-    /// Strategy to be used to generate calls from `target_reference`.
-    pub strategy: SBoxedStrategy<Option<CallDetails>>,
+    /// Runner that drives the strategy.
+    pub runner: Arc<Mutex<Runner>>,
+    /// Strategy to be used to generate calls from `target_reference`. Stored
+    /// behind a mutex so the cloneable [`RandomCallGenerator`] can mutate the
+    /// underlying closure state when sampling.
+    pub strategy: Arc<Mutex<WeightedCallStrategy>>,
     /// Reference to which contract we want a fuzzed calldata from.
     pub target_reference: Arc<RwLock<Address>>,
     /// Tracks the call depth when an override is active. When > 0, we're inside an overridden
@@ -37,19 +39,36 @@ pub struct RandomCallGenerator {
     pub last_sequence: Arc<RwLock<Vec<Option<BasicTxDetails>>>>,
 }
 
+impl std::fmt::Debug for RandomCallGenerator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RandomCallGenerator")
+            .field("test_address", &self.test_address)
+            .field("override_depth", &self.override_depth)
+            .field("replay", &self.replay)
+            .finish_non_exhaustive()
+    }
+}
+
 impl RandomCallGenerator {
     pub fn new(
         test_address: Address,
         handler_addresses: HashSet<Address>,
-        runner: TestRunner,
-        strategy: impl Strategy<Value = CallDetails> + Send + Sync + 'static,
+        runner: Runner,
+        mut strategy: Box<dyn FnMut(&mut dyn RngCore) -> CallDetails + Send + Sync>,
         target_reference: Arc<RwLock<Address>>,
     ) -> Self {
+        // 90% Some(call), 10% None — same shape as the prior `weighted(0.9, ..)` adapter.
+        let weighted: WeightedCallStrategy =
+            Box::new(
+                move |rng: &mut dyn RngCore| {
+                    if rng.random_ratio(9, 10) { Some(strategy(rng)) } else { None }
+                },
+            );
         Self {
             test_address,
             handler_addresses: Arc::new(RwLock::new(handler_addresses)),
             runner: Arc::new(Mutex::new(runner)),
-            strategy: weighted(0.9, strategy).sboxed(),
+            strategy: Arc::new(Mutex::new(weighted)),
             target_reference,
             last_sequence: Arc::default(),
             replay: false,
@@ -90,9 +109,17 @@ impl RandomCallGenerator {
             *self.target_reference.write() = original_caller;
 
             // `original_caller` has a 80% chance of being the `new_target`.
-            let choice = self.strategy.new_tree(&mut self.runner.lock()).unwrap().current().map(
-                |call_details| BasicTxDetails { warp: None, roll: None, sender, call_details },
-            );
+            let mut runner = self.runner.lock();
+            let mut strategy = self.strategy.lock();
+            let choice = strategy(runner.rng()).map(|call_details| BasicTxDetails {
+                warp: None,
+                roll: None,
+                deal: None,
+                sender,
+                call_details,
+            });
+            drop(strategy);
+            drop(runner);
 
             self.last_sequence.write().push(choice.clone());
             choice

@@ -57,31 +57,8 @@ contract FuzzerDictTest is Test {
         .assert_failure();
 });
 
-// tests that inline max-test-rejects config is properly applied
-forgetest_init!(test_inline_max_test_rejects, |prj, cmd| {
-    prj.add_test(
-        "Contract.t.sol",
-        r#"
-import {Test} from "forge-std/Test.sol";
-
-contract InlineMaxRejectsTest is Test {
-    /// forge-config: default.fuzz.max-test-rejects = 1
-    function test_fuzz_bound(uint256 a) public {
-        vm.assume(false);
-    }
-}
-   "#,
-    );
-
-    cmd.args(["test"]).assert_failure().stdout_eq(str![[r#"
-...
-[FAIL: `vm.assume` rejected too many inputs (1 allowed)] test_fuzz_bound(uint256) (runs: 0, [AVG_GAS])
-...
-"#]]);
-});
-
 // Tests that test timeout config is properly applied.
-// If test doesn't timeout after one second, then test will fail with `rejected too many inputs`.
+// `vm.assume(false)` silently retries forever, so the timeout is what allows the test to finish.
 forgetest_init!(test_fuzz_timeout, |prj, cmd| {
     prj.add_test(
         "Contract.t.sol",
@@ -89,7 +66,6 @@ forgetest_init!(test_fuzz_timeout, |prj, cmd| {
 import {Test} from "forge-std/Test.sol";
 
 contract FuzzTimeoutTest is Test {
-    /// forge-config: default.fuzz.max-test-rejects = 0
     /// forge-config: default.fuzz.timeout = 1
     function test_fuzz_bound(uint256 a) public pure {
         vm.assume(a == 0);
