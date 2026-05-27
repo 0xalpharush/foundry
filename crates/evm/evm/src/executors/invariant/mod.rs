@@ -604,8 +604,27 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                     None
                 };
                 // Collect edge coverage and set the flag in the current run.
-                if corpus_manager.merge_edge_coverage(&mut call_result) {
+                let new_call_coverage = corpus_manager.merge_edge_coverage(&mut call_result);
+                if new_call_coverage {
                     current_run.new_coverage = true;
+                }
+                // Drain the Fuzzer's sub-call buffer every tx so it doesn't grow across
+                // the run, but only hoist into the pool when this tx produced new
+                // coverage — gates pool growth to "interesting" traces. The unit-test
+                // seeder hoists unconditionally; this gate is fuzzing-only.
+                let observed = current_run
+                    .executor
+                    .inspector_mut()
+                    .fuzzer
+                    .as_mut()
+                    .map(|f| f.take_observed_calls())
+                    .unwrap_or_default();
+                if new_call_coverage {
+                    corpus_manager.hoist_observed_calls(
+                        &observed,
+                        current_run.inputs.last().expect("checked above"),
+                        &invariant_test.targeted_contracts,
+                    );
                 }
 
                 if discarded {
@@ -980,7 +999,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
         // Creates the invariant strategy.
         let strategy = invariant_strat(
             fuzz_state.clone(),
-            targeted_senders,
+            targeted_senders.clone(),
             targeted_contracts.clone(),
             self.config.clone(),
             fuzz_fixtures.clone(),
@@ -998,13 +1017,11 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
         // Set up fuzzer WITHOUT call_generator initially.
         // We defer call_override until after the initial invariant check to avoid
         // injecting random calls during setup which would break the invariant assertion.
-        self.executor.inspector_mut().set_fuzzer(Fuzzer {
-            call_generator: None,
-            collected_values: Vec::new(),
-            max_collected_values: self.config.dictionary.max_fuzz_dictionary_values,
+        self.executor.inspector_mut().set_fuzzer(Fuzzer::new(
+            self.config.dictionary.max_fuzz_dictionary_values,
             mapping_slots,
-            collect: true,
-        });
+            self.config.corpus.is_coverage_guided(),
+        ));
 
         // Let's make sure the invariant is sound before actually starting the run:
         // We'll assert the invariant in its initial state, and if it fails, we'll
@@ -1063,7 +1080,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
             }
         }
 
-        let worker = WorkerCorpus::new(
+        let mut worker = WorkerCorpus::new(
             0,
             self.config.corpus.clone(),
             strategy.boxed(),
@@ -1072,6 +1089,18 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
             Some(&targeted_contracts),
             Some(self.dynamic_target_ctx()),
         )?;
+
+        // Seed the corpus from sibling unit tests so the mutator starts from
+        // developer-chosen call sequences (e.g. clamped values, sequencing in
+        // the harness) instead of purely random inputs.
+        if let Err(err) = worker.seed_from_test_traces(
+            invariant_contract,
+            &targeted_contracts,
+            &targeted_senders,
+            &self.executor,
+        ) {
+            debug!(target: "corpus", %err, "failed to seed corpus from test traces");
+        }
 
         let mut invariant_test =
             InvariantTest::new(fuzz_state, targeted_contracts, failures, self.runner.clone());

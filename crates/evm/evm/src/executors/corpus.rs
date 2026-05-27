@@ -41,14 +41,17 @@ use crate::{
 };
 use alloy_dyn_abi::JsonAbiExt;
 use alloy_json_abi::Function;
-use alloy_primitives::{Address, Bytes, I256};
+use alloy_primitives::{Address, Bytes, I256, U256};
 use eyre::{Result, eyre};
-use foundry_common::{ContractsByAddress, ContractsByArtifact, sh_warn};
+use foundry_common::{ContractsByAddress, ContractsByArtifact, TestFunctionExt, sh_warn};
 use foundry_config::FuzzCorpusConfig;
-use foundry_evm_core::{evm::FoundryEvmNetwork, utils::StateChangeset};
+use foundry_evm_core::{constants::CALLER, evm::FoundryEvmNetwork, utils::StateChangeset};
 use foundry_evm_fuzz::{
-    BasicTxDetails,
-    invariant::{ArtifactFilters, FuzzRunIdentifiedContracts},
+    BasicTxDetails, CallDetails, ObservedCall,
+    invariant::{
+        ArtifactFilters, FuzzRunIdentifiedContracts, InvariantContract, SenderFilters,
+        TargetedContracts,
+    },
     strategies::{
         EvmFuzzState, FuzzStateReader, InvariantFuzzState, generate_msg_value, mutate_param_value,
     },
@@ -879,6 +882,201 @@ impl WorkerCorpus {
             .current())
     }
 
+    /// Bundles inner calls whose `(target, selector)` is in the allowed selector list
+    /// into a single multi-tx corpus entry and adds it to the in-memory corpus.
+    /// `observed` is typically the buffer drained from
+    /// [`Fuzzer::take_observed_calls`] after a tx (or unit test) executes.
+    ///
+    /// The intent is to capture calls that the harness has already shaped via clamping
+    /// or sequencing (e.g. values that survived a `bound(...)` modulus, or calls only
+    /// reachable after a specific setup). Treating the bundle as a normal corpus
+    /// entry — instead of a side pool — means it participates in mutation, eviction,
+    /// favoring, persistence, and inter-worker sync uniformly with all other entries.
+    ///
+    /// Skips any call whose target/calldata isn't in the allowed set per
+    /// [`TargetedContracts::can_replay`]. If the resulting allowed sequence is empty,
+    /// no corpus entry is added.
+    pub fn hoist_observed_calls(
+        &mut self,
+        observed: &[ObservedCall],
+        parent_tx: &BasicTxDetails,
+        targeted_contracts: &FuzzRunIdentifiedContracts,
+    ) {
+        if !self.config.is_coverage_guided() || observed.is_empty() {
+            return;
+        }
+
+        let seq = {
+            let targets = targeted_contracts.targets();
+            let mut seq = Vec::with_capacity(observed.len());
+            for call in observed {
+                let candidate = BasicTxDetails {
+                    warp: parent_tx.warp,
+                    roll: parent_tx.roll,
+                    sender: parent_tx.sender,
+                    call_details: CallDetails {
+                        target: call.target,
+                        calldata: call.calldata.clone(),
+                        value: call.value,
+                    },
+                };
+                if !targets.can_replay(&candidate) {
+                    continue;
+                }
+                seq.push(candidate);
+            }
+            seq
+        };
+
+        if seq.is_empty() {
+            return;
+        }
+
+        let entry = CorpusEntry::new(seq);
+        if let Some(worker_dir) = &self.worker_dir {
+            let dir = worker_dir.join(CORPUS_DIR);
+            if let Err(err) = entry.write_to_disk_in(&dir, self.config.corpus_gzip) {
+                debug!(target: "corpus", %err, "failed to persist hoisted entry");
+            }
+        }
+        let new_index = self.in_memory_corpus.len();
+        self.new_entry_indices.push(new_index);
+        self.metrics.corpus_count += 1;
+        self.in_memory_corpus.push(entry);
+    }
+
+    /// Seeds the corpus with sequences derived from sibling unit tests in the
+    /// invariant test contract. Each unit test (zero-input `test*` function) is run
+    /// against a clone of `executor`; depth-1 calls observed by the [`Fuzzer`]
+    /// inspector whose `(target, selector)` is in the allowed set become a single
+    /// corpus entry.
+    ///
+    /// The intent is to seed coverage-guided fuzzing with the call sequences a
+    /// developer has already chosen by hand, instead of having the mutator stumble
+    /// onto them from random generation.
+    ///
+    /// Reuses the `Fuzzer` inspector's call buffer rather than spinning up a full
+    /// `TracingInspector` — the inspector is already in the stack.
+    ///
+    /// Returns the number of seed sequences actually added.
+    pub fn seed_from_test_traces<FEN: FoundryEvmNetwork>(
+        &mut self,
+        invariant_contract: &InvariantContract<'_>,
+        targeted_contracts: &FuzzRunIdentifiedContracts,
+        sender_filters: &SenderFilters,
+        executor: &Executor<FEN>,
+    ) -> Result<usize> {
+        if !self.config.is_coverage_guided() {
+            return Ok(0);
+        }
+
+        // Pick a sender that the harness will accept as a top-level caller. Prefer a
+        // configured `targetSender`; otherwise fall back to foundry's default fuzz caller.
+        let sender = sender_filters.targeted.first().copied().unwrap_or(CALLER);
+        let worker_corpus_dir = self.worker_dir.as_ref().map(|d| d.join(CORPUS_DIR));
+        let mut added = 0;
+
+        for func in invariant_contract.abi.functions() {
+            if !func.is_unit_test() {
+                continue;
+            }
+            // Defensive: skip the invariant function itself even if it somehow classifies
+            // as a unit test (e.g. when using `invariant_*` naming on a no-input function).
+            if invariant_contract
+                .invariant_fns
+                .iter()
+                .any(|(invariant_fn, _)| func.selector() == invariant_fn.selector())
+            {
+                continue;
+            }
+
+            let calldata = match func.abi_encode_input(&[]) {
+                Ok(c) => Bytes::from(c),
+                Err(_) => continue,
+            };
+
+            // Run on a clone so seeding never mutates the campaign's setup state.
+            // Force the cloned Fuzzer to record sub-calls regardless of the campaign
+            // setting — we drain only this clone's buffer below.
+            let mut exec = executor.clone();
+            if let Some(fuzzer) = exec.inspector_mut().fuzzer.as_mut() {
+                fuzzer.record_calls = true;
+                let _ = fuzzer.take_observed_calls();
+            }
+
+            let raw = match exec.call_raw(
+                sender,
+                invariant_contract.address,
+                calldata.clone(),
+                U256::ZERO,
+            ) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if raw.reverted {
+                continue;
+            }
+
+            let observed = exec
+                .inspector_mut()
+                .fuzzer
+                .as_mut()
+                .map(|f| f.take_observed_calls())
+                .unwrap_or_default();
+            if observed.is_empty() {
+                continue;
+            }
+
+            // Build the depth-1 corpus sequence for this test. Lock briefly so we don't
+            // deadlock with the unconditional hoist below (which also locks targets).
+            let seq = {
+                let targets = targeted_contracts.targets();
+                sequence_from_observed(&observed, sender, &targets)
+            };
+
+            // Tests-derived calls are developer-curated, so always hoist every allowed
+            // sub-call into the pool (no coverage gate) — it gives the mutator more
+            // raw material than just the depth-1 sequence.
+            let synthetic_parent = BasicTxDetails {
+                warp: None,
+                roll: None,
+                sender,
+                call_details: CallDetails {
+                    target: invariant_contract.address,
+                    calldata: calldata.clone(),
+                    value: None,
+                },
+            };
+            self.hoist_observed_calls(&observed, &synthetic_parent, targeted_contracts);
+
+            if seq.is_empty() {
+                continue;
+            }
+
+            let entry = CorpusEntry::new(seq);
+            debug!(
+                target: "corpus",
+                test = %func.name,
+                seq_len = entry.tx_seq.len(),
+                "seeded corpus from test trace"
+            );
+
+            if let Some(dir) = &worker_corpus_dir
+                && let Err(err) = entry.write_to_disk_in(dir, self.config.corpus_gzip)
+            {
+                debug!(target: "corpus", %err, "failed to persist seed entry to disk");
+            }
+
+            let new_index = self.in_memory_corpus.len();
+            self.new_entry_indices.push(new_index);
+            self.metrics.corpus_count += 1;
+            self.in_memory_corpus.push(entry);
+            added += 1;
+        }
+
+        Ok(added)
+    }
+
     /// Returns the next call to be used in call sequence.
     /// If coverage guided fuzzing is not configured or if previous input was discarded then this is
     /// a new tx from strategy.
@@ -1391,6 +1589,37 @@ impl WorkerCorpus {
     }
 }
 
+/// Builds a corpus sequence from observed calls: keeps only `depth == 1` entries
+/// (direct calls from the test contract — the user-visible call sequence) that
+/// can be replayed against `targets`. Returned sequence is in execution order.
+fn sequence_from_observed(
+    observed: &[ObservedCall],
+    sender: Address,
+    targets: &TargetedContracts,
+) -> Vec<BasicTxDetails> {
+    let mut seq = Vec::new();
+    for call in observed {
+        if call.depth != 1 {
+            continue;
+        }
+        let tx = BasicTxDetails {
+            warp: None,
+            roll: None,
+            sender,
+            call_details: CallDetails {
+                target: call.target,
+                calldata: call.calldata.clone(),
+                value: call.value,
+            },
+        };
+        if !targets.can_replay(&tx) {
+            continue;
+        }
+        seq.push(tx);
+    }
+    seq
+}
+
 fn has_legacy_invariant_corpus_dirs(path: &Path) -> bool {
     std::fs::read_dir(path).is_ok_and(|entries| {
         entries.flatten().any(|entry| {
@@ -1406,7 +1635,6 @@ fn has_legacy_invariant_corpus_dirs(path: &Path) -> bool {
 mod tests {
     use super::*;
     use alloy_dyn_abi::DynSolValue;
-    use alloy_primitives::U256;
     use std::fs;
 
     fn basic_tx() -> BasicTxDetails {
@@ -1648,5 +1876,219 @@ mod tests {
 
         // Ensure the evicted one was the non-favored uuid.
         assert!(manager.in_memory_corpus.iter().all(|c| c.uuid != non_favored_uuid));
+    }
+
+    #[test]
+    fn hoist_observed_calls_bundles_allowed_subcalls_into_one_corpus_entry() {
+        use alloy_json_abi::{Function, JsonAbi};
+        use foundry_evm_fuzz::invariant::{
+            FuzzRunIdentifiedContracts, TargetedContract, TargetedContracts,
+        };
+
+        let target = Address::from([0x42; 20]);
+        let other = Address::from([0x43; 20]);
+
+        // `target` exposes `foo(uint256)` and `bar()`.
+        let foo = Function::parse("foo(uint256)").unwrap();
+        let bar = Function::parse("bar()").unwrap();
+        let foo_selector = foo.selector();
+        let bar_selector = bar.selector();
+        let mut abi = JsonAbi::new();
+        abi.functions.insert("foo".to_string(), vec![foo]);
+        abi.functions.insert("bar".to_string(), vec![bar]);
+
+        let mut targets = TargetedContracts::new();
+        targets.inner.insert(target, TargetedContract::new("Test".to_string(), abi));
+        let targeted_contracts = FuzzRunIdentifiedContracts::new(targets, false);
+
+        let mut foo_calldata = vec![0u8; 36];
+        foo_calldata[..4].copy_from_slice(&foo_selector[..]);
+        let bar_calldata = bar_selector.to_vec();
+        let mut wrong_selector = vec![0u8; 36];
+        wrong_selector[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+
+        let observed = vec![
+            // Allowed (target, foo) — must be included.
+            ObservedCall {
+                depth: 1,
+                target,
+                calldata: Bytes::from(foo_calldata.clone()),
+                value: None,
+            },
+            // Wrong target — must be filtered.
+            ObservedCall {
+                depth: 1,
+                target: other,
+                calldata: Bytes::from(foo_calldata.clone()),
+                value: None,
+            },
+            // Right target, wrong selector — must be filtered.
+            ObservedCall { depth: 2, target, calldata: Bytes::from(wrong_selector), value: None },
+            // Calldata < 4 bytes with no fallback/receive ABI — must be filtered.
+            ObservedCall { depth: 1, target, calldata: Bytes::from(vec![0u8; 3]), value: None },
+            // Allowed (target, bar) at deeper depth — must still be included.
+            ObservedCall {
+                depth: 3,
+                target,
+                calldata: Bytes::from(bar_calldata.clone()),
+                value: None,
+            },
+        ];
+
+        let parent_tx = basic_tx();
+        let (mut manager, _) = new_manager_with_single_corpus();
+        let initial_count = manager.in_memory_corpus.len();
+
+        manager.hoist_observed_calls(&observed, &parent_tx, &targeted_contracts);
+
+        assert_eq!(
+            manager.in_memory_corpus.len(),
+            initial_count + 1,
+            "one bundled corpus entry should be added per hoist invocation"
+        );
+        let added = manager.in_memory_corpus.last().unwrap();
+        assert_eq!(
+            added.tx_seq.len(),
+            2,
+            "only the two allowed (target, foo)/(target, bar) sub-calls should pass the filter"
+        );
+        assert_eq!(added.tx_seq[0].call_details.target, target);
+        assert_eq!(&added.tx_seq[0].call_details.calldata[..4], &foo_selector[..]);
+        assert_eq!(added.tx_seq[1].call_details.target, target);
+        assert_eq!(&added.tx_seq[1].call_details.calldata[..4], &bar_selector[..]);
+
+        // Re-hoisting produces another entry — eviction handles long-term bloat,
+        // not per-call dedup.
+        manager.hoist_observed_calls(&observed, &parent_tx, &targeted_contracts);
+        assert_eq!(manager.in_memory_corpus.len(), initial_count + 2);
+    }
+
+    #[test]
+    fn hoist_observed_calls_skips_when_no_allowed_subcalls() {
+        use alloy_json_abi::JsonAbi;
+        use foundry_evm_fuzz::invariant::{
+            FuzzRunIdentifiedContracts, TargetedContract, TargetedContracts,
+        };
+
+        let target = Address::from([0x42; 20]);
+        let mut targets = TargetedContracts::new();
+        // Empty ABI -> nothing replayable on `target`.
+        targets.inner.insert(target, TargetedContract::new("Test".to_string(), JsonAbi::new()));
+        let targeted_contracts = FuzzRunIdentifiedContracts::new(targets, false);
+
+        let observed = vec![ObservedCall {
+            depth: 1,
+            target,
+            calldata: Bytes::from(vec![0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0]),
+            value: None,
+        }];
+
+        let parent_tx = basic_tx();
+        let (mut manager, _) = new_manager_with_single_corpus();
+        let initial_count = manager.in_memory_corpus.len();
+
+        manager.hoist_observed_calls(&observed, &parent_tx, &targeted_contracts);
+
+        assert_eq!(
+            manager.in_memory_corpus.len(),
+            initial_count,
+            "must not push an empty corpus entry"
+        );
+    }
+
+    #[test]
+    fn hoist_observed_calls_allows_fallback_value_calls() {
+        use alloy_json_abi::{Fallback, JsonAbi, StateMutability};
+        use foundry_evm_fuzz::invariant::{
+            FuzzRunIdentifiedContracts, TargetedContract, TargetedContracts,
+        };
+
+        let target = Address::from([0x42; 20]);
+        let mut abi = JsonAbi::new();
+        abi.fallback = Some(Fallback { state_mutability: StateMutability::Payable });
+
+        let mut targets = TargetedContracts::new();
+        targets.inner.insert(target, TargetedContract::new("Test".to_string(), abi));
+        let targeted_contracts = FuzzRunIdentifiedContracts::new(targets, false);
+
+        let value = U256::from(1);
+        let observed =
+            vec![ObservedCall { depth: 1, target, calldata: Bytes::new(), value: Some(value) }];
+
+        let parent_tx = basic_tx();
+        let (mut manager, _) = new_manager_with_single_corpus();
+        let initial_count = manager.in_memory_corpus.len();
+
+        manager.hoist_observed_calls(&observed, &parent_tx, &targeted_contracts);
+
+        assert_eq!(manager.in_memory_corpus.len(), initial_count + 1);
+        let added = manager.in_memory_corpus.last().unwrap();
+        assert_eq!(added.tx_seq.len(), 1);
+        assert_eq!(added.tx_seq[0].call_details.target, target);
+        assert!(added.tx_seq[0].call_details.calldata.is_empty());
+        assert_eq!(added.tx_seq[0].call_details.value, Some(value));
+    }
+
+    #[test]
+    fn sequence_from_observed_takes_only_depth_one_allowed_calls() {
+        use alloy_json_abi::{Function, JsonAbi};
+        use foundry_evm_fuzz::invariant::{TargetedContract, TargetedContracts};
+
+        let target = Address::from([0x42; 20]);
+        let other = Address::from([0x43; 20]);
+
+        // Targets allow both `foo(uint256)` and `bar()` on `target`.
+        let foo = Function::parse("foo(uint256)").unwrap();
+        let bar = Function::parse("bar()").unwrap();
+        let foo_sel = foo.selector();
+        let bar_sel = bar.selector();
+        let mut abi = JsonAbi::new();
+        abi.functions.insert("foo".to_string(), vec![foo]);
+        abi.functions.insert("bar".to_string(), vec![bar]);
+
+        let mut targets = TargetedContracts::new();
+        targets.inner.insert(target, TargetedContract::new("Test".to_string(), abi));
+
+        let mut foo_calldata = vec![0u8; 36];
+        foo_calldata[..4].copy_from_slice(&foo_sel[..]);
+        let bar_calldata = bar_sel.to_vec();
+
+        // Simulates an observed trace shaped like:
+        //   test contract
+        //     ├─ depth 1: target.foo(...)          ← keep
+        //     │     └─ depth 2: target.bar()       ← drop (not depth-1)
+        //     ├─ depth 1: other.foo(...)           ← drop (wrong target)
+        //     └─ depth 1: target.bar()             ← keep
+        let observed = vec![
+            ObservedCall {
+                depth: 1,
+                target,
+                calldata: Bytes::from(foo_calldata.clone()),
+                value: None,
+            },
+            ObservedCall {
+                depth: 2,
+                target,
+                calldata: Bytes::from(bar_calldata.clone()),
+                value: None,
+            },
+            ObservedCall {
+                depth: 1,
+                target: other,
+                calldata: Bytes::from(foo_calldata),
+                value: None,
+            },
+            ObservedCall { depth: 1, target, calldata: Bytes::from(bar_calldata), value: None },
+        ];
+
+        let sender = Address::from([0xaa; 20]);
+        let seq = sequence_from_observed(&observed, sender, &targets);
+
+        assert_eq!(seq.len(), 2, "should keep only depth-1 allowed calls");
+        assert_eq!(seq[0].sender, sender);
+        assert_eq!(seq[0].call_details.target, target);
+        assert_eq!(&seq[0].call_details.calldata[..4], &foo_sel[..]);
+        assert_eq!(seq[1].call_details.target, target);
+        assert_eq!(&seq[1].call_details.calldata[..4], &bar_sel[..]);
     }
 }

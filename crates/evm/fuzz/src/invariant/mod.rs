@@ -131,7 +131,10 @@ impl TargetedContracts {
         match self.inner.get(&tx.call_details.target) {
             Some(c) => (
                 Some(&c.abi),
-                c.abi.functions().find(|f| f.selector() == tx.call_details.calldata[..4]),
+                tx.call_details
+                    .calldata
+                    .get(..4)
+                    .and_then(|selector| c.abi.functions().find(|f| f.selector() == selector)),
             ),
             None => (None, None),
         }
@@ -149,7 +152,15 @@ impl TargetedContracts {
     /// Returns whether the given transaction can be replayed or not with known contracts.
     pub fn can_replay(&self, tx: &BasicTxDetails) -> bool {
         match self.inner.get(&tx.call_details.target) {
-            Some(c) => c.abi.functions().any(|f| f.selector() == tx.call_details.calldata[..4]),
+            Some(c) => match tx.call_details.calldata.get(..4) {
+                Some(selector) => {
+                    c.abi.functions().any(|f| f.selector() == selector) || c.abi.fallback.is_some()
+                }
+                None => {
+                    c.abi.fallback.is_some()
+                        || (tx.call_details.calldata.is_empty() && c.abi.receive.is_some())
+                }
+            },
             None => false,
         }
     }
@@ -161,7 +172,12 @@ impl TargetedContracts {
             contract
                 .abi
                 .functions()
-                .find(|f| f.selector() == tx.call_details.calldata[..4])
+                .find(|f| {
+                    tx.call_details
+                        .calldata
+                        .get(..4)
+                        .is_some_and(|selector| f.selector() == selector)
+                })
                 .map(|function| format!("{}.{}", contract.identifier.clone(), function.name))
         })
     }
