@@ -79,6 +79,8 @@ pub struct ContractRunner<'a, FEN: FoundryEvmNetwork> {
     tcfg: Cow<'a, TestRunnerConfig<FEN>>,
     /// The parent runner.
     mcr: &'a MultiContractRunner<FEN>,
+    /// Calldata seeds collected from unit test traces.
+    call_seeds: &'a [Bytes],
 }
 
 impl<'a, FEN: FoundryEvmNetwork> Deref for ContractRunner<'a, FEN> {
@@ -99,6 +101,7 @@ impl<'a, FEN: FoundryEvmNetwork> ContractRunner<'a, FEN> {
         tokio_handle: &'a tokio::runtime::Handle,
         span: Span,
         mcr: &'a MultiContractRunner<FEN>,
+        call_seeds: &'a [Bytes],
     ) -> Self {
         Self {
             name,
@@ -109,6 +112,7 @@ impl<'a, FEN: FoundryEvmNetwork> ContractRunner<'a, FEN> {
             span,
             tcfg: Cow::Borrowed(&mcr.tcfg),
             mcr,
+            call_seeds,
         }
     }
 
@@ -576,6 +580,76 @@ impl<'a, FEN: FoundryEvmNetwork> ContractRunner<'a, FEN> {
         let duration = start.elapsed();
         SuiteResult::new(duration, test_results, warnings)
     }
+
+    /// Traces every zero-arg unit test in this contract and returns successful subcall calldata.
+    pub fn collect_call_seeds(mut self) -> Vec<Bytes> {
+        let setup_fns: Vec<_> =
+            self.contract.abi.functions().filter(|func| func.name.is_setup()).collect();
+        if setup_fns.len() > 1 {
+            return Vec::new();
+        }
+        let call_setup = setup_fns.len() == 1 && setup_fns[0].name == "setUp";
+
+        let prev_tracer = self.executor.inspector_mut().tracer.take();
+        self.executor.set_tracing(TraceMode::Call);
+        let setup = self.setup(call_setup);
+        self.executor.inspector_mut().tracer = prev_tracer;
+        if setup.reason.is_some() {
+            return Vec::new();
+        }
+
+        let mut seeds = Vec::new();
+        for func in self
+            .contract
+            .abi
+            .functions()
+            .filter(|func| func.is_unit_test() && !func.is_any_test_fail())
+            .filter(|func| self.function_matches_network_pass(func))
+        {
+            let mut runner = FunctionRunner::new(&self, &setup);
+            if runner.apply_function_inline_config(func).is_err()
+                || runner.prepare_test(func).is_err()
+            {
+                continue;
+            }
+            runner.executor.to_mut().set_tracing(TraceMode::Call);
+            let mut raw_call_result = match runner.executor.call(
+                runner.sender,
+                runner.address,
+                func,
+                &[],
+                U256::ZERO,
+                Some(runner.revert_decoder()),
+            ) {
+                Ok(res) => res.raw,
+                Err(EvmError::Execution(err)) => err.raw,
+                Err(_) => continue,
+            };
+
+            if runner.executor.is_raw_call_mut_success(
+                runner.address,
+                &mut raw_call_result,
+                /* should_fail */ false,
+            ) {
+                collect_call_seed_calldata(&raw_call_result, &mut seeds);
+            }
+        }
+        seeds
+    }
+}
+
+fn collect_call_seed_calldata<FEN: FoundryEvmNetwork>(
+    raw_call_result: &RawCallResult<FEN>,
+    seeds: &mut Vec<Bytes>,
+) {
+    let Some(traces) = &raw_call_result.traces else {
+        return;
+    };
+    for node in traces.arena.nodes().iter().skip(1) {
+        if node.trace.success && !node.trace.kind.is_any_create() && node.trace.data.len() >= 4 {
+            seeds.push(node.trace.data.clone());
+        }
+    }
 }
 
 /// Executes a single test function, returning a [`TestResult`].
@@ -919,6 +993,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
             config,
             identified_contracts,
             &self.cr.mcr.known_contracts,
+            self.cr.call_seeds,
         );
 
         // Showmap replay mode: replay the persisted corpus and emit coverage

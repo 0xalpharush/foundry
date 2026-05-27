@@ -6,8 +6,8 @@ use crate::{
         EvmFuzzState, FuzzStateReader, InvariantFuzzState, fuzz_calldata_from_state, fuzz_param,
     },
 };
-use alloy_json_abi::Function;
-use alloy_primitives::{Address, U256};
+use alloy_json_abi::{Function, StateMutability};
+use alloy_primitives::{Address, Bytes, U256};
 use foundry_config::InvariantConfig;
 use parking_lot::RwLock;
 use proptest::prelude::*;
@@ -82,6 +82,12 @@ pub fn invariant_strat(
     config: InvariantConfig,
     fuzz_fixtures: FuzzFixtures,
 ) -> impl Strategy<Value = BasicTxDetails> {
+    enum Call {
+        Function(Function),
+        Fallback { payable: bool },
+        Receive,
+    }
+
     let senders = Rc::new(senders);
     let dictionary_weight = config.dictionary.dictionary_weight;
 
@@ -93,17 +99,52 @@ pub fn invariant_strat(
     any::<prop::sample::Selector>()
         .prop_flat_map(move |selector| {
             let contracts = contracts.targets();
-            let functions = contracts.fuzzed_functions();
-            let (target_address, target_function) = selector.select(functions);
+            let calls = contracts.iter().flat_map(|(address, contract)| {
+                let functions = contract
+                    .abi_fuzzed_functions()
+                    .cloned()
+                    .map(|func| (*address, Call::Function(func)));
+                let special = contract.targeted_functions.is_empty().then(|| {
+                    contract.abi.receive.map(|_| (*address, Call::Receive)).into_iter().chain(
+                        contract.abi.fallback.map(|fallback| {
+                            (
+                                *address,
+                                Call::Fallback {
+                                    payable: fallback.state_mutability == StateMutability::Payable,
+                                },
+                            )
+                        }),
+                    )
+                });
+                functions.chain(special.into_iter().flatten())
+            });
+            let (target_address, target_call) = selector.select(calls);
 
             let sender = select_random_sender(&fuzz_state, senders.clone(), dictionary_weight);
 
-            let call_details = fuzz_contract_with_calldata(
-                &fuzz_state,
-                &fuzz_fixtures,
-                *target_address,
-                target_function.clone(),
-            );
+            let call_details = match target_call {
+                Call::Function(func) => {
+                    fuzz_contract_with_calldata(&fuzz_state, &fuzz_fixtures, target_address, func)
+                        .boxed()
+                }
+                Call::Fallback { payable } => {
+                    let value = if payable { fuzz_msg_value().boxed() } else { Just(None).boxed() };
+                    value
+                        .prop_map(move |value| CallDetails {
+                            target: target_address,
+                            calldata: Bytes::from_static(&[0]),
+                            value,
+                        })
+                        .boxed()
+                }
+                Call::Receive => fuzz_msg_value()
+                    .prop_map(move |value| CallDetails {
+                        target: target_address,
+                        calldata: Bytes::new(),
+                        value,
+                    })
+                    .boxed(),
+            };
 
             let warp = warp_roll_strat(config.max_time_delay.is_some());
             let roll = warp_roll_strat(config.max_block_delay.is_some());
@@ -178,4 +219,59 @@ pub fn fuzz_contract_with_calldata<S: FuzzStateReader>(
         trace!(input=?calldata, ?value);
         CallDetails { target, calldata, value }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::invariant::{TargetedContract, TargetedContracts};
+    use alloy_json_abi::{Fallback, JsonAbi, Receive};
+    use proptest::{
+        strategy::ValueTree,
+        test_runner::{Config, TestRunner},
+    };
+
+    fn tx_for_abi(abi: JsonAbi) -> BasicTxDetails {
+        let target = Address::repeat_byte(0x11);
+        let mut targets = TargetedContracts::new();
+        targets.inner.insert(target, TargetedContract::new("Target".to_string(), abi));
+        let contracts = FuzzRunIdentifiedContracts::new(targets, /* is_updatable */ false);
+        let mut runner =
+            TestRunner::new(Config { failure_persistence: None, ..Default::default() });
+
+        invariant_strat(
+            EvmFuzzState::test().into(),
+            SenderFilters::new(
+                /* targeted */ vec![Address::repeat_byte(0x22)],
+                /* excluded */ vec![],
+            ),
+            contracts,
+            InvariantConfig::default(),
+            FuzzFixtures::default(),
+        )
+        .new_tree(&mut runner)
+        .unwrap()
+        .current()
+    }
+
+    #[test]
+    fn invariant_strat_can_call_receive() {
+        let mut abi = JsonAbi::new();
+        abi.receive = Some(Receive { state_mutability: StateMutability::Payable });
+        let tx = tx_for_abi(abi);
+
+        assert_eq!(tx.call_details.target, Address::repeat_byte(0x11));
+        assert!(tx.call_details.calldata.is_empty());
+    }
+
+    #[test]
+    fn invariant_strat_can_call_fallback() {
+        let mut abi = JsonAbi::new();
+        abi.fallback = Some(Fallback { state_mutability: StateMutability::NonPayable });
+        let tx = tx_for_abi(abi);
+
+        assert_eq!(tx.call_details.target, Address::repeat_byte(0x11));
+        assert_eq!(tx.call_details.calldata, Bytes::from_static(&[0]));
+        assert_eq!(tx.call_details.value, None);
+    }
 }

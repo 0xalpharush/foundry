@@ -168,16 +168,12 @@ impl TargetedContracts {
     /// Identifies fuzzed contract and function based on given tx details and returns unique metric
     /// key composed from contract identifier and function name.
     pub fn fuzzed_metric_key(&self, tx: &BasicTxDetails) -> Option<String> {
+        let selector = tx.call_details.calldata.get(..4)?;
         self.inner.get(&tx.call_details.target).and_then(|contract| {
             contract
                 .abi
                 .functions()
-                .find(|f| {
-                    tx.call_details
-                        .calldata
-                        .get(..4)
-                        .is_some_and(|selector| f.selector() == selector)
-                })
+                .find(|f| f.selector() == selector)
                 .map(|function| format!("{}.{}", contract.identifier.clone(), function.name))
         })
     }

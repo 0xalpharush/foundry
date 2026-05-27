@@ -193,6 +193,7 @@ impl<FEN: FoundryEvmNetwork> MultiContractRunner<FEN> {
             self.contracts.len(),
             find_time,
         );
+        let call_seeds = self.collect_call_seeds(filter, &db, &tokio_handle);
 
         if show_progress {
             let tests_progress = TestsProgress::new(contracts.len(), rayon::current_num_threads());
@@ -210,6 +211,7 @@ impl<FEN: FoundryEvmNetwork> MultiContractRunner<FEN> {
                         filter,
                         &tokio_handle,
                         Some(&tests_progress),
+                        &call_seeds,
                     );
 
                     tests_progress
@@ -229,12 +231,78 @@ impl<FEN: FoundryEvmNetwork> MultiContractRunner<FEN> {
         } else {
             contracts.par_iter().for_each(|&(id, contract)| {
                 let _guard = tokio_handle.enter();
-                let result = self.run_test_suite(id, contract, &db, filter, &tokio_handle, None);
+                let result = self.run_test_suite(
+                    id,
+                    contract,
+                    &db,
+                    filter,
+                    &tokio_handle,
+                    None,
+                    &call_seeds,
+                );
                 let _ = tx.send((id.identifier(), result));
             })
         }
 
         Ok(())
+    }
+
+    fn collect_call_seeds(
+        &self,
+        filter: &dyn TestFilter,
+        db: &Backend<FEN>,
+        tokio_handle: &tokio::runtime::Handle,
+    ) -> Vec<Bytes> {
+        if self.tcfg.showmap.is_some() {
+            return Vec::new();
+        }
+        if !self.matching_contracts(filter).any(|(_, contract)| {
+            contract
+                .abi
+                .functions()
+                .any(|func| filter.matches_test_function(func) && func.is_invariant_test())
+        }) {
+            return Vec::new();
+        }
+
+        let mut seeds = self
+            .contracts
+            .par_iter()
+            .filter(|(id, contract)| {
+                filter.matches_path(&id.source)
+                    && filter.matches_contract(&id.name)
+                    && contract
+                        .abi
+                        .functions()
+                        .any(|func| func.is_unit_test() && !func.is_any_test_fail())
+            })
+            .flat_map(|(artifact_id, contract)| {
+                let _guard = tokio_handle.enter();
+                let identifier = artifact_id.identifier();
+                let executor = self.tcfg.executor(
+                    self.known_contracts.clone(),
+                    self.analysis.clone(),
+                    artifact_id,
+                    db.clone(),
+                );
+                ContractRunner::new(
+                    &identifier,
+                    contract,
+                    executor,
+                    None,
+                    tokio_handle,
+                    tracing::Span::none(),
+                    self,
+                    &[],
+                )
+                .collect_call_seeds()
+            })
+            .collect::<Vec<_>>();
+
+        seeds.sort();
+        seeds.dedup();
+        debug!(target: "corpus", count = seeds.len(), "collected unit test call seeds");
+        seeds
     }
 
     fn run_test_suite(
@@ -245,6 +313,7 @@ impl<FEN: FoundryEvmNetwork> MultiContractRunner<FEN> {
         filter: &dyn TestFilter,
         tokio_handle: &tokio::runtime::Handle,
         progress: Option<&TestsProgress>,
+        call_seeds: &[Bytes],
     ) -> SuiteResult {
         let identifier = artifact_id.identifier();
         let span_name = if enabled!(tracing::Level::TRACE) {
@@ -272,6 +341,7 @@ impl<FEN: FoundryEvmNetwork> MultiContractRunner<FEN> {
             tokio_handle,
             span,
             self,
+            call_seeds,
         );
         let r = runner.run_tests(filter);
 

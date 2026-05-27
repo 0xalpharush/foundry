@@ -434,6 +434,8 @@ pub struct InvariantExecutor<'a, FEN: FoundryEvmNetwork> {
     /// Contracts that are part of the project but have not been deployed yet. We need the bytecode
     /// to identify them from the stateset changes.
     project_contracts: &'a ContractsByArtifact,
+    /// Calldata seeds collected from unit test traces.
+    call_seeds: &'a [Bytes],
     /// Filters contracts to be fuzzed through their artifact identifiers.
     artifact_filters: ArtifactFilters,
 }
@@ -446,6 +448,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
         config: InvariantConfig,
         setup_contracts: &'a ContractsByAddress,
         project_contracts: &'a ContractsByArtifact,
+        call_seeds: &'a [Bytes],
     ) -> Self {
         Self {
             executor,
@@ -453,6 +456,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
             config,
             setup_contracts,
             project_contracts,
+            call_seeds,
             artifact_filters: ArtifactFilters::default(),
         }
     }
@@ -608,24 +612,6 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                 if new_call_coverage {
                     current_run.new_coverage = true;
                 }
-                // Drain the Fuzzer's sub-call buffer every tx so it doesn't grow across
-                // the run, but only hoist into the pool when this tx produced new
-                // coverage — gates pool growth to "interesting" traces. The unit-test
-                // seeder hoists unconditionally; this gate is fuzzing-only.
-                let observed = current_run
-                    .executor
-                    .inspector_mut()
-                    .fuzzer
-                    .as_mut()
-                    .map(|f| f.take_observed_calls())
-                    .unwrap_or_default();
-                if new_call_coverage {
-                    corpus_manager.hoist_observed_calls(
-                        &observed,
-                        current_run.inputs.last().expect("checked above"),
-                        &invariant_test.targeted_contracts,
-                    );
-                }
 
                 if discarded {
                     current_run.inputs.pop();
@@ -638,6 +624,16 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                         break 'stop;
                     }
                 } else {
+                    if new_call_coverage {
+                        corpus_manager.record_call_seed(
+                            &current_run
+                                .inputs
+                                .last()
+                                .expect("checked above")
+                                .call_details
+                                .calldata,
+                        );
+                    }
                     // Commit executed call result.
                     current_run.executor.commit(&mut call_result);
 
@@ -999,7 +995,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
         // Creates the invariant strategy.
         let strategy = invariant_strat(
             fuzz_state.clone(),
-            targeted_senders.clone(),
+            targeted_senders,
             targeted_contracts.clone(),
             self.config.clone(),
             fuzz_fixtures.clone(),
@@ -1020,7 +1016,6 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
         self.executor.inspector_mut().set_fuzzer(Fuzzer::new(
             self.config.dictionary.max_fuzz_dictionary_values,
             mapping_slots,
-            self.config.corpus.is_coverage_guided(),
         ));
 
         // Let's make sure the invariant is sound before actually starting the run:
@@ -1090,17 +1085,11 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
             Some(self.dynamic_target_ctx()),
         )?;
 
-        // Seed the corpus from sibling unit tests so the mutator starts from
-        // developer-chosen call sequences (e.g. clamped values, sequencing in
-        // the harness) instead of purely random inputs.
-        if let Err(err) = worker.seed_from_test_traces(
-            invariant_contract,
-            &targeted_contracts,
-            &targeted_senders,
-            &self.executor,
-        ) {
-            debug!(target: "corpus", %err, "failed to seed corpus from test traces");
+        let mut added = 0;
+        for calldata in self.call_seeds {
+            added += usize::from(worker.record_call_seed(calldata));
         }
+        debug!(target: "corpus", added, total = self.call_seeds.len(), "seeded calls from unit test traces");
 
         let mut invariant_test =
             InvariantTest::new(fuzz_state, targeted_contracts, failures, self.runner.clone());
@@ -1120,7 +1109,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
     /// format). They will be used to filter contracts after the `setUp`, and more importantly,
     /// during the runs.
     ///
-    /// Also excludes any contract without any mutable functions.
+    /// Also excludes any contract without any mutable functions, fallback, or receive.
     ///
     /// Priority:
     ///
@@ -1154,20 +1143,9 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
             }
         }
 
-        // Exclude any artifact without mutable functions.
+        // Exclude any artifact without callable fuzz targets.
         for (artifact, contract) in self.project_contracts.iter() {
-            if contract
-                .abi
-                .functions()
-                .filter(|func| {
-                    !matches!(
-                        func.state_mutability,
-                        alloy_json_abi::StateMutability::Pure
-                            | alloy_json_abi::StateMutability::View
-                    )
-                })
-                .count()
-                == 0
+            if !has_fuzzable_entrypoint(&contract.abi)
                 && !self.artifact_filters.excluded.contains(&artifact.identifier())
             {
                 self.artifact_filters.excluded.push(artifact.identifier());
@@ -1491,6 +1469,17 @@ fn collect_data<FEN: FoundryEvmNetwork>(
     }
 }
 
+fn has_fuzzable_entrypoint(abi: &alloy_json_abi::JsonAbi) -> bool {
+    abi.receive.is_some()
+        || abi.fallback.is_some()
+        || abi.functions().any(|func| {
+            !matches!(
+                func.state_mutability,
+                alloy_json_abi::StateMutability::Pure | alloy_json_abi::StateMutability::View
+            )
+        })
+}
+
 /// Calls the `afterInvariant()` function on a contract.
 /// Returns call result and if call succeeded.
 /// The state after the call is not persisted.
@@ -1569,7 +1558,34 @@ pub(crate) fn execute_tx<FEN: FoundryEvmNetwork>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_json_abi::{Fallback, JsonAbi, Receive, StateMutability};
     use serde_json::json;
+
+    #[test]
+    fn fuzzable_entrypoint_includes_fallback_and_receive() {
+        assert!(!has_fuzzable_entrypoint(&JsonAbi::new()));
+
+        let mut view_only = JsonAbi::new();
+        view_only.functions.insert(
+            "peek".to_string(),
+            vec![Function::parse("function peek() external view").unwrap()],
+        );
+        assert!(!has_fuzzable_entrypoint(&view_only));
+
+        let mut mutable = JsonAbi::new();
+        mutable
+            .functions
+            .insert("poke".to_string(), vec![Function::parse("function poke() external").unwrap()]);
+        assert!(has_fuzzable_entrypoint(&mutable));
+
+        let mut receive = JsonAbi::new();
+        receive.receive = Some(Receive { state_mutability: StateMutability::Payable });
+        assert!(has_fuzzable_entrypoint(&receive));
+
+        let mut fallback = JsonAbi::new();
+        fallback.fallback = Some(Fallback { state_mutability: StateMutability::NonPayable });
+        assert!(has_fuzzable_entrypoint(&fallback));
+    }
 
     #[test]
     fn invariant_progress_json_includes_throughput_fields() {
